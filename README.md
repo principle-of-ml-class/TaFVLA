@@ -299,6 +299,73 @@ percentage, and steps/second are shown by the progress row. In non-TTY contexts
 ANSI cursor movement is disabled and a plain-text summary is emitted only at
 the configured logging/validation intervals.
 
+## trainctl Discord training notifications
+
+The project pins trainctl `0.1.0` to the verified upstream commit
+`61d3d61d975086ee1bff6a6bdc79cc4d568cebc5` with its `discord` extra. A normal
+locked install is therefore sufficient:
+
+```bash
+uv sync --locked
+```
+
+Create a Discord incoming webhook and expose it only through the environment.
+Do not put the URL in YAML, shell history shared with others, checkpoints, W&B,
+or committed `.env` files:
+
+```bash
+export TRAINCTL_DISCORD_WEBHOOK_URL="<YOUR_WEBHOOK_URL>"
+uv run trainctl config show
+```
+
+`config show` reports only whether the webhook is configured. It does not print
+the credential. The verified trainctl CLI invocation is:
+
+```bash
+uv run trainctl run \
+  --name taf-adapter-T5 \
+  --checkpoint-dir outputs/taf_adapter \
+  --total-steps 25000 \
+  -- python -m script.train_adapter \
+    data.window_size=5 \
+    training.max_steps=25000 \
+    training.output_dir=outputs/taf_adapter
+```
+
+Add `data.root_dir=/path/to/TaF-Dataset` when the configured dataset path is not
+valid on the current machine. Hydra overrides are resolved before the start
+annotation, so `data.window_size`, batch/accumulation, learning rate, schedule,
+and output directory shown in Discord are the values actually used.
+
+trainctl emits its automatic process started/completed/failed events. The
+training SDK additionally emits one detailed start annotation, structured
+metrics at `training.log_every`, validation and alignment metrics when those
+evaluations actually run, a concise event after each successfully written
+checkpoint, and one detailed successful-finish annotation. Metric logging does
+not create a Discord message for every step. Every numbered checkpoint is
+validated at its own optimizer step; an already completed validation at that
+step is reused. Alignment values are attached only when fixed-set retrieval ran
+at that same step. `last.pt` is also validated at its final step and registered
+directly, since `step_00001000.pt` is intentionally not renamed to match the
+default filename watcher.
+
+The SDK is non-strict, defaults to rank 0 under `RANK`/`LOCAL_RANK`, and becomes
+a no-op when the command is not launched by `trainctl run`. The existing direct
+workflow remains valid and produces the same training artifacts:
+
+```bash
+uv run python -m script.train_adapter \
+  data.window_size=5 \
+  training.output_dir=outputs/taf_adapter
+```
+
+On Python exceptions or `Ctrl+C`, the SDK adds a short failure annotation and
+the original exception is re-raised so the supervisor records a failed run.
+Abrupt termination such as `SIGTERM` cannot produce the success annotation;
+the supervisor still reports the nonzero/terminated process. Exception text is
+credential-redacted, and finite numeric filtering prevents NaN/Inf values from
+entering trainctl. Never print or pass the webhook URL as a Hydra override.
+
 ## Cross-modal alignment evaluation
 
 Training uses mini-batch InfoNCE diagnostics, while the alignment evaluator uses

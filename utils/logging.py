@@ -417,6 +417,13 @@ class ExperimentLogger:
             "last_logged_step": self.last_wandb_step,
         }
 
+    def wandb_url(self) -> str | None:
+        """Return the public run URL only after W&B created the run."""
+        if self.run is None:
+            return None
+        value = getattr(self.run, "url", None)
+        return str(value) if value else None
+
     def close_progress(self) -> None:
         if self.progress is not None:
             self.progress.close()

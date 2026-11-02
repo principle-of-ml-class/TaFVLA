@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -41,6 +42,14 @@ from utils.data import (
 )
 from utils.logging import ExperimentLogger, scalar_metrics
 from utils.model_factory import build_model
+from utils.trainctl import (
+    TrainctlReporter,
+    ValidationHistory,
+    build_checkpoint_message,
+    build_failure_message,
+    build_finish_message,
+    build_start_message,
+)
 
 
 register_config_schema()
@@ -146,11 +155,7 @@ def _run_alignment_evaluation(
         allow_same_step=True,
         images=images,
     )
-    return {
-        "last_evaluated_step": global_step,
-        "last_evaluated_completed_epoch": completed_epoch,
-        "last_evaluation_label": evaluation_label,
-    }
+    return record
 
 
 def run_training(cfg: DictConfig) -> None:
@@ -336,6 +341,52 @@ def run_training(cfg: DictConfig) -> None:
     finally:
         # Experiment tracking must not change training randomness.
         restore_rng_state(rng_before_wandb)
+
+    max_steps = int(train_cfg.max_steps)
+    started = time.time()
+    reporter = TrainctlReporter()
+    wandb_state = logger.wandb_state() or {}
+    run_id = os.environ.get("TRAINCTL_RUN_ID")
+    try:
+        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    except ValueError:
+        world_size = 1
+    gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
+    start_message = build_start_message({
+        "window_size": int(data_cfg.window_size),
+        "experiment": wandb_state.get("run_name") or cfg.wandb.name,
+        "run_id": run_id or wandb_state.get("run_id"),
+        "stride": int(data_cfg.stride),
+        "batch_size": int(train_cfg.batch_size),
+        "accumulation": int(train_cfg.gradient_accumulation_steps),
+        "effective_batch_size": (
+            int(train_cfg.batch_size)
+            * int(train_cfg.gradient_accumulation_steps)
+            * world_size
+        ),
+        "optimizer": "AdamW",
+        "learning_rate": float(train_cfg.learning_rate),
+        "initial_step": step,
+        "total_steps": max_steps,
+        "validate_every": int(train_cfg.validate_every),
+        "save_every": int(train_cfg.save_every),
+        "train_windows": len(train_indices),
+        "train_groups": len(train_keys),
+        "val_windows": len(val_indices),
+        "val_groups": len(val_keys),
+        "amp": amp_enabled,
+        "device": str(device),
+        "gpu": gpu_name,
+        "backbone": str(cfg.tactile_encoder.backbone),
+        "freeze_backbone": bool(cfg.tactile_encoder.freeze_backbone),
+        "output_dir": str(output_dir),
+        "resume": str(resume_path) if resume_path else None,
+        "wandb_url": logger.wandb_url(),
+    })
+    reporter.start(
+        name=wandb_state.get("run_name"), total_steps=max_steps,
+        message=start_message,
+    )
     validation_sampling_record: dict[str, Any] = {
         "record_type": "validation_sampling",
         **{
@@ -355,14 +406,79 @@ def run_training(cfg: DictConfig) -> None:
         f"violating_batches={validation_sampler.report.violating_batches}, "
         f"seed={validation_sampler.report.seed}"
     )
-    max_steps = int(train_cfg.max_steps)
     logger.start_progress(max_steps, initial_step=step)
     accumulation = int(train_cfg.gradient_accumulation_steps)
     optimizer.zero_grad(set_to_none=True)
     local_rolling: dict[str, list[float]] = defaultdict(list)
     wandb_rolling: dict[str, list[float]] = defaultdict(list)
     micro_step = step * accumulation
-    started = time.time()
+    validation_history = ValidationHistory()
+    last_alignment_record: dict[str, Any] | None = None
+    last_train_record: dict[str, Any] | None = None
+    last_checkpoint_path: Path | None = None
+    initial_step = step
+    pending_checkpoint: tuple[Path, int, int, dict[str, Any]] | None = None
+    last_optimization: dict[str, Any] = {
+        "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+        "train/gradient_norm": float("nan"),
+    }
+
+    def report_saved_checkpoint(
+        path: Path, checkpoint_step: int, checkpoint_epoch: int,
+        optimization_metrics: dict[str, Any], aliases: list[str],
+    ) -> None:
+        nonlocal last_checkpoint_path
+        last_checkpoint_path = path
+        validation = validation_history.last_metrics
+        if validation_history.last_step != checkpoint_step or validation is None:
+            raise RuntimeError(
+                f"Checkpoint {path} has no validation from step {checkpoint_step}"
+            )
+        alignment = (
+            last_alignment_record
+            if last_alignment_record is not None
+            and int(last_alignment_record["global_step"]) == checkpoint_step
+            else None
+        )
+        train_summary = dict(last_train_record or {})
+        train_summary.update({
+            "train/gradient_norm": optimization_metrics["train/gradient_norm"],
+            "train/learning_rate": optimization_metrics["train/learning_rate"],
+        })
+        elapsed = max(0.0, time.time() - started)
+        completed_steps = max(0, checkpoint_step - initial_step)
+        rate = completed_steps / elapsed if elapsed > 0 else 0.0
+        eta = (
+            (max_steps - checkpoint_step) / rate
+            if rate > 0 and checkpoint_step < max_steps else 0.0
+        )
+        info = {
+            "step": checkpoint_step,
+            "total_steps": max_steps,
+            "progress": 100.0 * checkpoint_step / max_steps,
+            "epoch": checkpoint_epoch,
+            "path": path,
+            "size_mib": path.stat().st_size / (1024 * 1024),
+            "validation": validation,
+            "alignment": alignment,
+            "train": train_summary,
+            "elapsed": elapsed,
+            "steps_per_second": rate,
+            "eta": eta,
+            "best_loss": validation_history.best_loss,
+            "best_step": validation_history.best_step,
+            "improved": validation_history.last_improved,
+        }
+        metrics = {**validation, **train_summary}
+        if alignment:
+            metrics.update({
+                key: value for key, value in alignment.items()
+                if key.startswith("alignment/")
+            })
+        reporter.checkpoint(
+            path, step=checkpoint_step, metrics=metrics,
+            message=build_checkpoint_message(info), aliases=aliases,
+        )
 
     failed = True
     try:
@@ -421,6 +537,7 @@ def run_training(cfg: DictConfig) -> None:
                     "epoch": epoch,
                     "train/elapsed_time_seconds": elapsed,
                 }
+                last_optimization = dict(optimization)
 
                 if step % int(train_cfg.log_every) == 0:
                     local_record: dict[str, Any] = {
@@ -433,6 +550,14 @@ def run_training(cfg: DictConfig) -> None:
                     }
                     logger.write(local_record)
                     logger.update_training(local_record)
+                    last_train_record = dict(local_record)
+                    reporter.log(step, {
+                        key: value for key, value in local_record.items()
+                        if key.startswith("train/")
+                    } | {
+                        "train/gradient_norm": float(grad_norm),
+                        "train/learning_rate": learning_rate,
+                    })
                     local_rolling.clear()
 
                 wandb_payload: dict[str, float | int] = {}
@@ -442,49 +567,62 @@ def run_training(cfg: DictConfig) -> None:
                     wandb_rolling.clear()
 
                 validate_every = int(train_cfg.validate_every)
-                if validate_every > 0 and step % validate_every == 0:
-                    val_metrics = validate(
-                        model,
-                        val_loader,
-                        device,
-                        amp_enabled,
-                        int(train_cfg.validation_batches)
-                        if train_cfg.validation_batches is not None
-                        else None,
+                checkpoint_due = step % int(train_cfg.save_every) == 0
+                scheduled_validation = (
+                    validate_every > 0 and step % validate_every == 0
+                )
+                if scheduled_validation or checkpoint_due:
+                    def evaluate_current_step() -> dict[str, float]:
+                        val_metrics = validate(
+                            model,
+                            val_loader,
+                            device,
+                            amp_enabled,
+                            int(train_cfg.validation_batches)
+                            if train_cfg.validation_batches is not None
+                            else None,
+                        )
+                        requested_batches = (
+                            int(train_cfg.validation_batches)
+                            if train_cfg.validation_batches is not None
+                            else None
+                        )
+                        evaluated_batches = min(
+                            len(validation_sampler),
+                            requested_batches
+                            if requested_batches is not None
+                            else len(validation_sampler),
+                        )
+                        diagnostics = {
+                            "val/evaluated_batches": evaluated_batches,
+                            "val/evaluated_samples": (
+                                evaluated_batches * int(train_cfg.batch_size)
+                            ),
+                            "val/sampling_dropped_samples": (
+                                validation_sampler.report.dropped_samples
+                            ),
+                            "val/sampling_min_window_start_gap": validation_gap,
+                        }
+                        record = {
+                            "step": step, "epoch": epoch,
+                            **diagnostics, **val_metrics,
+                        }
+                        logger.write(record)
+                        logger.update_validation(record)
+                        model.train()
+                        return record
+
+                    val_record, validation_ran = validation_history.ensure(
+                        step, evaluate_current_step
                     )
-                    requested_validation_batches = (
-                        int(train_cfg.validation_batches)
-                        if train_cfg.validation_batches is not None
-                        else None
-                    )
-                    evaluated_validation_batches = min(
-                        len(validation_sampler),
-                        requested_validation_batches
-                        if requested_validation_batches is not None
-                        else len(validation_sampler),
-                    )
-                    val_diagnostics = {
-                        "val/evaluated_batches": evaluated_validation_batches,
-                        "val/evaluated_samples": (
-                            evaluated_validation_batches * int(train_cfg.batch_size)
-                        ),
-                        "val/sampling_dropped_samples": (
-                            validation_sampler.report.dropped_samples
-                        ),
-                        "val/sampling_min_window_start_gap": validation_gap,
-                    }
-                    val_record = {
-                        "step": step,
-                        "epoch": epoch,
-                        **val_diagnostics,
-                        **val_metrics,
-                    }
-                    logger.write(val_record)
-                    logger.update_validation(val_record)
-                    wandb_payload.update(val_metrics)
-                    wandb_payload.update(val_diagnostics)
-                    wandb_payload.update(optimization)
-                    model.train()
+                    if validation_ran:
+                        val_payload = {
+                            key: value for key, value in val_record.items()
+                            if key.startswith("val/")
+                        }
+                        reporter.log(step, val_payload)
+                        wandb_payload.update(val_payload)
+                        wandb_payload.update(optimization)
 
                 if wandb_payload:
                     logger.log_wandb(wandb_payload, step)
@@ -513,7 +651,7 @@ def run_training(cfg: DictConfig) -> None:
                     evaluation_label = (
                         "epoch" if is_last_epoch_batch and epoch_due else "step"
                     )
-                    alignment_state.update(_run_alignment_evaluation(
+                    last_alignment_record = _run_alignment_evaluation(
                         model=model,
                         loader=alignment_loader,
                         device=device,
@@ -530,11 +668,23 @@ def run_training(cfg: DictConfig) -> None:
                         visualize=(
                             epoch_visualize if evaluation_label == "epoch" else False
                         ),
-                    ))
+                    )
+                    alignment_state.update({
+                        "last_evaluated_step": step,
+                        "last_evaluated_completed_epoch": int(
+                            last_alignment_record["completed_epoch"]
+                        ),
+                        "last_evaluation_label": evaluation_label,
+                    })
+                    reporter.log(step, {
+                        key: value for key, value in last_alignment_record.items()
+                        if key.startswith("alignment/")
+                    })
 
-                if step % int(train_cfg.save_every) == 0:
+                if checkpoint_due:
+                    checkpoint_path = output_dir / f"step_{step:08d}.pt"
                     save_checkpoint(
-                        output_dir / f"step_{step:08d}.pt",
+                        checkpoint_path,
                         model=model,
                         optimizer=optimizer,
                         scaler=scaler,
@@ -547,6 +697,20 @@ def run_training(cfg: DictConfig) -> None:
                         wandb_state=logger.wandb_state(),
                         alignment_state=alignment_state,
                     )
+                    last_checkpoint_path = checkpoint_path
+                    aliases = ["latest"]
+                    if validation_history.last_improved:
+                        aliases.append("best")
+                    if is_last_epoch_batch:
+                        pending_checkpoint = (
+                            checkpoint_path, step, epoch + 1,
+                            dict(optimization),
+                        )
+                    else:
+                        report_saved_checkpoint(
+                            checkpoint_path, step, epoch + 1,
+                            optimization, aliases,
+                        )
                 if step >= max_steps:
                     # DataLoader 길이는 custom sampler의 실제 yield 수와 다를 수
                     # 있으므로 한 번 peek해 정말 마지막 batch였는지 판정한다.
@@ -575,7 +739,7 @@ def run_training(cfg: DictConfig) -> None:
                     last_evaluated_step=int(alignment_state["last_evaluated_step"]),
                 ):
                     assert alignment_loader is not None
-                    alignment_state.update(_run_alignment_evaluation(
+                    last_alignment_record = _run_alignment_evaluation(
                         model=model,
                         loader=alignment_loader,
                         device=device,
@@ -586,7 +750,16 @@ def run_training(cfg: DictConfig) -> None:
                         completed_epoch=completed_epochs,
                         evaluation_label="epoch",
                         visualize=should_visualize,
-                    ))
+                    )
+                    alignment_state.update({
+                        "last_evaluated_step": step,
+                        "last_evaluated_completed_epoch": completed_epochs,
+                        "last_evaluation_label": "epoch",
+                    })
+                    reporter.log(step, {
+                        key: value for key, value in last_alignment_record.items()
+                        if key.startswith("alignment/")
+                    })
             epoch += 1
             if epoch_completed and step % int(train_cfg.save_every) == 0:
                 # Epoch 마지막 step에서 먼저 저장된 numbered checkpoint를
@@ -605,6 +778,19 @@ def run_training(cfg: DictConfig) -> None:
                     wandb_state=logger.wandb_state(),
                     alignment_state=alignment_state,
                 )
+                last_checkpoint_path = output_dir / f"step_{step:08d}.pt"
+                if pending_checkpoint is not None:
+                    path_value, step_value, epoch_value, optimization_value = (
+                        pending_checkpoint
+                    )
+                    aliases = ["latest"]
+                    if validation_history.last_improved:
+                        aliases.append("best")
+                    report_saved_checkpoint(
+                        path_value, step_value, epoch_value,
+                        optimization_value, aliases,
+                    )
+                    pending_checkpoint = None
 
         if should_run_final_alignment(
             enabled=bool(cfg.alignment_eval.enabled),
@@ -613,7 +799,7 @@ def run_training(cfg: DictConfig) -> None:
             last_evaluated_step=int(alignment_state["last_evaluated_step"]),
         ):
             assert alignment_loader is not None
-            alignment_state.update(_run_alignment_evaluation(
+            last_alignment_record = _run_alignment_evaluation(
                 model=model,
                 loader=alignment_loader,
                 device=device,
@@ -624,10 +810,65 @@ def run_training(cfg: DictConfig) -> None:
                 completed_epoch=completed_epochs,
                 evaluation_label="final",
                 visualize=False,
-            ))
+            )
+            alignment_state.update({
+                "last_evaluated_step": step,
+                "last_evaluated_completed_epoch": completed_epochs,
+                "last_evaluation_label": "final",
+            })
+            reporter.log(step, {
+                key: value for key, value in last_alignment_record.items()
+                if key.startswith("alignment/")
+            })
 
+        def evaluate_final_step() -> dict[str, float]:
+            val_metrics = validate(
+                model, val_loader, device, amp_enabled,
+                int(train_cfg.validation_batches)
+                if train_cfg.validation_batches is not None else None,
+            )
+            requested_batches = (
+                int(train_cfg.validation_batches)
+                if train_cfg.validation_batches is not None else None
+            )
+            evaluated_batches = min(
+                len(validation_sampler),
+                requested_batches
+                if requested_batches is not None else len(validation_sampler),
+            )
+            diagnostics = {
+                "val/evaluated_batches": evaluated_batches,
+                "val/evaluated_samples": (
+                    evaluated_batches * int(train_cfg.batch_size)
+                ),
+                "val/sampling_dropped_samples": (
+                    validation_sampler.report.dropped_samples
+                ),
+                "val/sampling_min_window_start_gap": validation_gap,
+            }
+            record = {"step": step, "epoch": epoch, **diagnostics, **val_metrics}
+            logger.write(record)
+            logger.update_validation(record)
+            model.train()
+            return record
+
+        final_validation, final_validation_ran = validation_history.ensure(
+            step, evaluate_final_step
+        )
+        if final_validation_ran:
+            final_val_payload = {
+                key: value for key, value in final_validation.items()
+                if key.startswith("val/")
+            }
+            reporter.log(step, final_val_payload)
+            logger.log_wandb(
+                {**final_val_payload, **last_optimization},
+                step, allow_same_step=True,
+            )
+
+        last_path = output_dir / "last.pt"
         save_checkpoint(
-            output_dir / "last.pt",
+            last_path,
             model=model,
             optimizer=optimizer,
             scaler=scaler,
@@ -640,13 +881,52 @@ def run_training(cfg: DictConfig) -> None:
             wandb_state=logger.wandb_state(),
             alignment_state=alignment_state,
         )
+        last_checkpoint_path = last_path
+        last_aliases = ["last", "latest"]
+        if validation_history.last_improved:
+            last_aliases.append("best")
+        report_saved_checkpoint(
+            last_path, step, epoch, last_optimization, last_aliases,
+        )
         logger.close_progress()
         logger.message(
-            f"Training complete at step {step}; checkpoint: {output_dir / 'last.pt'}"
+            f"Training complete at step {step}; checkpoint: {last_path}"
         )
+        final_wandb_url = logger.wandb_url()
+        logger.finish(exit_code=0)
+        current_alignment = (
+            last_alignment_record
+            if last_alignment_record is not None
+            and int(last_alignment_record["global_step"]) == step
+            else None
+        )
+        reporter.finish(build_finish_message({
+            "step": step,
+            "total_steps": max_steps,
+            "elapsed": time.time() - started,
+            "best_loss": validation_history.best_loss,
+            "best_step": validation_history.best_step,
+            "validation": final_validation,
+            "alignment": current_alignment,
+            "checkpoint_count": reporter.checkpoint_count,
+            "last_checkpoint": last_path,
+            "wandb_url": final_wandb_url,
+            "window_size": int(data_cfg.window_size),
+        }))
         failed = False
+    except BaseException as exc:
+        reporter.fail(build_failure_message(
+            exc,
+            step=step,
+            window_size=int(data_cfg.window_size),
+            checkpoint=last_checkpoint_path,
+            validation=validation_history.last_metrics,
+            elapsed=time.time() - started,
+        ))
+        raise
     finally:
-        logger.finish(exit_code=1 if failed else 0)
+        if failed:
+            logger.finish(exit_code=1)
 
 
 @hydra.main(version_base="1.3", config_path="../config", config_name="taf_adapter")
