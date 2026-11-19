@@ -159,7 +159,12 @@ class TrainingProgress:
                 + " | Recon " + self._value(val, "val/loss_recon")
             ),
             "             | Recall@1 " + self._value(val, "val/recall_at_1"),
-            f"Cross-Modal Retrieval | {alignment_title}",
+            f"Cross-Modal Retrieval | {alignment_title}" + (
+                " | " + " ".join(
+                    f"{name}:{self._value(alignment, f'alignment/dynamics/{name}/recall_at_1').strip()}"
+                    for name in ("loading", "unloading", "holding", "transition", "sudden_event")
+                ) if "alignment/dynamics/all/queries" in alignment else ""
+            ),
             (
                 "Tactile -> Force | R@1 "
                 + self._value(alignment, "alignment/t2f/recall_at_1")
@@ -248,6 +253,10 @@ class TrainingProgress:
             f"positive={self._value(metrics, 'alignment/t2f/positive_cosine').strip()} "
             f"negative={self._value(metrics, 'alignment/t2f/negative_cosine').strip()} "
             f"hard_gap={self._value(metrics, 'alignment/t2f/hard_negative_margin').strip()}"
+            + (" | dynamics R@1 " + " ".join(
+                f"{name}={self._value(metrics, f'alignment/dynamics/{name}/recall_at_1').strip()}"
+                for name in ("loading", "unloading", "holding", "transition", "sudden_event")
+            ) if "alignment/dynamics/all/queries" in metrics else "")
         )
 
     def message(self, message: str) -> None:
@@ -322,6 +331,7 @@ class ExperimentLogger:
             self.run.define_metric("alignment/*", step_metric="global_step")
             self.run.define_metric("alignment/t2f/*", step_metric="global_step")
             self.run.define_metric("alignment/f2t/*", step_metric="global_step")
+            self.run.define_metric("alignment/dynamics/*", step_metric="global_step")
             self.run.define_metric("alignment/visualization/*", step_metric="global_step")
             if bool(self.config.watch_model):
                 self.run.watch(model, log="gradients", log_freq=int(self.config.log_every))

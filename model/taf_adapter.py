@@ -30,6 +30,7 @@ class TaFAdapter(nn.Module):
         tactile_encoder: dict[str, Any] | None = None,
         loss: dict[str, Any] | None = None,
         normalization_eps: float = 1e-6,
+        tactile_initialization_seed: int | None = None,
     ) -> None:
         super().__init__()
         force_cfg = dict(force_encoder or {})
@@ -52,7 +53,12 @@ class TaFAdapter(nn.Module):
         tactile_cfg.setdefault("output_dim", self.force_encoder.output_dim)
         if int(tactile_cfg["output_dim"]) != self.force_encoder.output_dim:
             raise ValueError("Tactile output_dim must equal pressure_latent_dim + force_latent_dim")
-        self.tactile_encoder = TactileEncoder(**tactile_cfg)
+        if tactile_initialization_seed is None:
+            self.tactile_encoder = TactileEncoder(**tactile_cfg)
+        else:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(tactile_initialization_seed)
+                self.tactile_encoder = TactileEncoder(**tactile_cfg)
         self.window_size = int(window_size)
         self.lambda_quant = float(loss_cfg.get("lambda_quant", 1.0))
         self.lambda_recon = float(loss_cfg.get("lambda_recon", 1.0))

@@ -239,6 +239,15 @@ def evaluate_alignment(
     return compute_alignment_metrics(tactile, force)
 
 
+def evaluate_alignment_dynamics(
+    result: AlignmentResult, query_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Group query ranks after scoring against the unchanged full gallery."""
+    from utils.comparison_eval import retrieval_by_dynamics
+
+    return retrieval_by_dynamics(result.similarity, query_rows)
+
+
 def similarity_distributions(
     similarity: torch.Tensor,
     *,

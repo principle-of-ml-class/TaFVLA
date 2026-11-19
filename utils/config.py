@@ -123,6 +123,18 @@ class CheckConfig:
 
 
 @dataclass
+class ComparisonConfig:
+    enabled: bool = False
+    manifest: Optional[str] = None
+    sampling_seed: int = 42
+    gallery_seed: int = 42
+    gallery_max_pairs: int = 256
+    min_anchor_gap: int = 20
+    window_sizes: list[int] = field(default_factory=lambda: [1, 3, 5, 7, 10, 20])
+    training_seeds: list[int] = field(default_factory=lambda: [42, 43, 44])
+
+
+@dataclass
 class TaFConfig:
     data: DataConfig = field(default_factory=DataConfig)
     force_encoder: ForceEncoderConfig = field(default_factory=ForceEncoderConfig)
@@ -133,6 +145,7 @@ class TaFConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     alignment_eval: AlignmentEvalConfig = field(default_factory=AlignmentEvalConfig)
     check: CheckConfig = field(default_factory=CheckConfig)
+    comparison: ComparisonConfig = field(default_factory=ComparisonConfig)
 
 
 def register_config_schema() -> None:

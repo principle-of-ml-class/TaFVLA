@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -14,10 +16,14 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Subset
 
 from dataset.taf_dataset import TaFDataset
+from utils.dynamics import ManifestDataset
+from utils.comparison_eval import write_rows
 from utils.alignment import (
+    AlignmentSelection,
     alignment_schedule,
     create_alignment_visualizations,
     evaluate_alignment,
+    evaluate_alignment_dynamics,
     save_alignment_selection,
     select_alignment_indices,
     should_run_epoch_alignment,
@@ -138,6 +144,18 @@ def _run_alignment_evaluation(
         "alignment/figure_paths": figure_paths,
         **result.metrics,
     }
+    if bool(cfg.comparison.enabled):
+        selected = loader.dataset
+        query_rows = [selected.dataset.rows[index] for index in selected.indices]
+        queries, support = evaluate_alignment_dynamics(result, query_rows)
+        for group, values in support.items():
+            for metric in ("recall_at_1", "recall_at_5", "mrr"):
+                if values[metric] is not None:
+                    record[f"alignment/dynamics/{group}/{metric}"] = values[metric]
+            record[f"alignment/dynamics/{group}/queries"] = values["queries"]
+        record["dynamics_support"] = support
+        query_path = output_dir / "alignment" / f"queries_step_{global_step:08d}.parquet"
+        write_rows(queries, query_path)
     logger.write(record)
     logger.update_alignment(record)
     wandb_metrics = {
@@ -165,9 +183,12 @@ def run_training(cfg: DictConfig) -> None:
     seed = int(train_cfg.seed)
     set_seed(seed)
 
-    dataset = TaFDataset(
+    comparison = bool(cfg.comparison.enabled)
+    if comparison:
+        suffix = f"N{int(data_cfg.window_size)}_seed{seed}"
+    source = TaFDataset(
         resolve_path(data_cfg.root_dir),
-        window_size=int(data_cfg.window_size),
+        window_size=1 if comparison else int(data_cfg.window_size),
         stride=int(data_cfg.stride),
         image_size=tuple(data_cfg.image_size),
         sensor_types=data_cfg.sensor_types,
@@ -181,14 +202,43 @@ def run_training(cfg: DictConfig) -> None:
         ),
         show_initialization_progress=bool(data_cfg.show_initialization_progress),
     )
-    audit_temporal_alignment(dataset, int(data_cfg.alignment_decode_windows_per_episode))
-    split = split_by_group(
-        dataset,
-        unit=str(data_cfg.split_unit),
-        validation_fraction=float(data_cfg.validation_fraction),
-        seed=int(data_cfg.split_seed),
-    )
-    train_indices, val_indices, train_eps, _, train_keys, val_keys = split
+    audit_temporal_alignment(source, int(data_cfg.alignment_decode_windows_per_episode))
+    dataset = ManifestDataset(source, resolve_path(cfg.comparison.manifest), int(data_cfg.window_size)) if comparison else source
+    if comparison:
+        train_indices = [i for i, r in enumerate(dataset.rows) if r["split"] == "train"]
+        val_indices = [i for i, r in enumerate(dataset.rows) if r["split"] == "validation"]
+        test_indices = [i for i, r in enumerate(dataset.rows) if r["split"] == "test"]
+        if not train_indices or not val_indices or not test_indices:
+            raise ValueError("Manifest must contain nonempty train, validation and test splits")
+        ids = {id(ep): i for i, ep in enumerate(dataset.episodes)}
+        train_eps = {ids[id(dataset._locate(i)[0])] for i in train_indices}
+        train_keys = sorted({dataset.rows[i]["sequence_id"] for i in train_indices})
+        val_keys = sorted({dataset.rows[i]["sequence_id"] for i in val_indices})
+        if int(dataset.rows[0]["split_seed"]) != int(data_cfg.split_seed):
+            raise ValueError("Manifest split_seed differs from data.split_seed")
+        gallery_path = resolve_path(cfg.comparison.manifest).with_name("gallery_plan.json")
+        if not gallery_path.is_file():
+            raise FileNotFoundError(f"Comparison gallery plan is required: {gallery_path}")
+        gallery = json.loads(gallery_path.read_text(encoding="utf-8"))
+        if (gallery.get("manifest_id") != dataset.manifest_id or
+            gallery.get("seed") != int(cfg.comparison.gallery_seed) or
+            gallery.get("max_pairs") != int(cfg.comparison.gallery_max_pairs) or
+            gallery.get("min_gap") != int(cfg.comparison.min_anchor_gap)):
+            raise ValueError("Gallery plan differs from comparison settings/manifest")
+        gallery_id = hashlib.sha256(gallery_path.read_bytes()).hexdigest()
+        comparison_identity = {"manifest_id": dataset.manifest_id, "label_sha256": dataset.rows[0]["label_sha256"],
+                               "split_seed": int(data_cfg.split_seed), "window_size": int(data_cfg.window_size),
+                               "training_seed": seed, "sampling_seed": int(cfg.comparison.sampling_seed),
+                               "gallery_seed": int(cfg.comparison.gallery_seed), "gallery_id": gallery_id,
+                               "min_anchor_gap": int(cfg.comparison.min_anchor_gap),
+                               "batch_size": int(train_cfg.batch_size),
+                               "gradient_accumulation_steps": int(train_cfg.gradient_accumulation_steps)}
+        cfg.wandb.name = f"{cfg.wandb.name}_{suffix}_{dataset.manifest_id[:8]}" if cfg.wandb.name else f"{suffix}_{dataset.manifest_id[:8]}"
+    else:
+        split = split_by_group(dataset, unit=str(data_cfg.split_unit),
+                               validation_fraction=float(data_cfg.validation_fraction), seed=int(data_cfg.split_seed))
+        train_indices, val_indices, train_eps, _, train_keys, val_keys = split
+        comparison_identity = None
     print(
         f"Split by {data_cfg.split_unit}: "
         f"train={len(train_indices)} windows/{len(train_keys)} groups, "
@@ -198,6 +248,8 @@ def run_training(cfg: DictConfig) -> None:
     resume_path = resolve_path(train_cfg.resume) if train_cfg.resume else None
     checkpoint = load_checkpoint(resume_path) if resume_path else None
     if checkpoint is not None:
+        if comparison and checkpoint.get("comparison_identity") != comparison_identity:
+            raise ValueError("Resume checkpoint comparison identity differs from current manifest/N/seeds")
         saved_split = checkpoint.get("split", {})
         if (
             saved_split.get("train_groups") != train_keys
@@ -208,15 +260,30 @@ def run_training(cfg: DictConfig) -> None:
             raise ValueError("Resume checkpoint has no normalization statistics")
         normalization = checkpoint["normalization"]
     else:
-        normalization = compute_normalization(
-            dataset,
-            train_eps,
-            int(data_cfg.normalization_chunk_frames),
-            float(data_cfg.normalization_eps),
-        )
+        normalization_path = (resolve_path(cfg.comparison.manifest).with_name(
+            f"normalization_{dataset.manifest_id[:8]}.pt") if comparison else None)
+        if comparison and normalization_path.is_file():
+            stored = torch.load(normalization_path, map_location="cpu", weights_only=True)
+            if stored.get("manifest_id") != dataset.manifest_id or stored.get("train_groups") != train_keys:
+                raise ValueError("Shared normalization identity differs from current manifest/split")
+            normalization = stored["normalization"]
+        else:
+            normalization = compute_normalization(
+                dataset, train_eps, int(data_cfg.normalization_chunk_frames),
+                float(data_cfg.normalization_eps), selected_indices=train_indices if comparison else None,
+                normalization_window_size=max(cfg.comparison.window_sizes) if comparison else None,
+            )
+            if comparison:
+                temporary = normalization_path.with_suffix(".pt.tmp")
+                torch.save({"manifest_id": dataset.manifest_id, "train_groups": train_keys,
+                            "normalization": normalization}, temporary)
+                temporary.replace(normalization_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(cfg)
+    if comparison:
+        model = build_model(cfg, tactile_initialization_seed=seed + 10_000)
+    else:
+        model = build_model(cfg)
     model.set_normalization(**normalization)
     model.to(device)
     optimizer = torch.optim.AdamW(
@@ -236,12 +303,12 @@ def run_training(cfg: DictConfig) -> None:
         restore_rng(checkpoint)
         print(f"Resumed {resume_path} at optimizer step {step}")
 
-    batch_sampler = TemporalDiverseBatchSampler(
+    batch_sampler = (FixedValidationBatchSampler if comparison else TemporalDiverseBatchSampler)(
         dataset,
         train_indices,
         batch_size=int(train_cfg.batch_size),
         min_gap=int(train_cfg.min_same_episode_window_gap),
-        seed=seed,
+        seed=int(cfg.comparison.sampling_seed) if comparison else seed,
     )
     workers = int(train_cfg.num_workers)
     train_loader = DataLoader(
@@ -273,6 +340,10 @@ def run_training(cfg: DictConfig) -> None:
     )
 
     output_dir = resolve_path(train_cfg.output_dir)
+    if comparison:
+        output_dir = output_dir / f"{dataset.manifest_id[:8]}_N{int(data_cfg.window_size)}_seed{seed}"
+        if resume_path is None and output_dir.exists() and any(output_dir.iterdir()):
+            raise FileExistsError(f"Comparison run directory already contains results: {output_dir}; use training.resume")
     saved_alignment = dict(checkpoint.get("alignment", {})) if checkpoint is not None else {}
     completed_epochs = int(
         saved_alignment.get(
@@ -290,14 +361,30 @@ def run_training(cfg: DictConfig) -> None:
     }
     alignment_loader: DataLoader | None = None
     if bool(cfg.alignment_eval.enabled):
-        selection = select_alignment_indices(
-            dataset,
-            val_indices,
-            max_pairs=int(cfg.alignment_eval.retrieval_max_pairs),
-            min_window_start_gap=int(cfg.alignment_eval.min_window_start_gap),
-            random_seed=int(cfg.alignment_eval.random_seed),
-            training_indices=train_indices,
-        )
+        if comparison:
+            lookup = {row["sample_id"]: i for i, row in enumerate(dataset.rows)}
+            ids = gallery["validation"]
+            if len(ids) != len(set(ids)) or any(s not in lookup for s in ids):
+                raise ValueError("Validation gallery plan has duplicate or unknown sample IDs")
+            indices = [lookup[s] for s in ids]
+            if any(dataset.rows[i]["split"] != "validation" for i in indices):
+                raise ValueError("Validation gallery plan contains non-validation samples")
+            selection = AlignmentSelection(
+                indices=indices,
+                samples=[{"dataset_index": i, **dataset.rows[i]} for i in indices],
+                random_seed=int(gallery["seed"]),
+                requested_max_pairs=int(gallery["max_pairs"]),
+                requested_min_gap=int(gallery["min_gap"]),
+                effective_min_gap=int(gallery["min_gap"]),
+            )
+        else:
+            selection = select_alignment_indices(
+                dataset, val_indices,
+                max_pairs=int(cfg.alignment_eval.retrieval_max_pairs),
+                min_window_start_gap=int(cfg.alignment_eval.min_window_start_gap),
+                random_seed=int(cfg.alignment_eval.random_seed),
+                training_indices=train_indices,
+            )
         saved_indices = saved_alignment.get("sample_indices")
         if saved_indices is not None and list(saved_indices) != selection.indices:
             raise ValueError(
@@ -305,7 +392,7 @@ def run_training(cfg: DictConfig) -> None:
             )
         alignment_state.update({
             "sample_indices": selection.indices,
-            "random_seed": int(cfg.alignment_eval.random_seed),
+            "random_seed": selection.random_seed,
             "effective_min_window_start_gap": selection.effective_min_gap,
         })
         save_alignment_selection(
@@ -313,7 +400,7 @@ def run_training(cfg: DictConfig) -> None:
             output_dir / "alignment" / "validation_selection.json",
         )
         alignment_generator = torch.Generator()
-        alignment_generator.manual_seed(int(cfg.alignment_eval.random_seed))
+        alignment_generator.manual_seed(selection.random_seed)
         alignment_loader = DataLoader(
             Subset(dataset, selection.indices),
             batch_size=min(int(train_cfg.batch_size), len(selection.indices)),
@@ -335,6 +422,11 @@ def run_training(cfg: DictConfig) -> None:
         cfg.wandb,
         checkpoint.get("wandb") if checkpoint is not None else None,
     )
+    if comparison:
+        logger.write({"record_type": "comparison", **comparison_identity,
+                      "sampling": batch_sampler.report.as_dict(),
+                      "force_parameters": sum(p.numel() for p in model.force_encoder.parameters()),
+                      "tactile_parameters": sum(p.numel() for p in model.tactile_encoder.parameters())})
     rng_before_wandb = capture_rng()
     try:
         logger.start(cfg, model)
@@ -344,6 +436,7 @@ def run_training(cfg: DictConfig) -> None:
 
     max_steps = int(train_cfg.max_steps)
     started = time.time()
+    prior_duration = float(checkpoint.get("training_duration_seconds", 0.0)) if checkpoint is not None else 0.0
     reporter = TrainctlReporter()
     wandb_state = logger.wandb_state() or {}
     run_id = os.environ.get("TRAINCTL_RUN_ID")
@@ -696,6 +789,8 @@ def run_training(cfg: DictConfig) -> None:
                         val_keys=val_keys,
                         wandb_state=logger.wandb_state(),
                         alignment_state=alignment_state,
+                        comparison_identity=comparison_identity,
+                        training_duration_seconds=prior_duration + time.time() - started,
                     )
                     last_checkpoint_path = checkpoint_path
                     aliases = ["latest"]
@@ -777,6 +872,8 @@ def run_training(cfg: DictConfig) -> None:
                     val_keys=val_keys,
                     wandb_state=logger.wandb_state(),
                     alignment_state=alignment_state,
+                    comparison_identity=comparison_identity,
+                    training_duration_seconds=prior_duration + time.time() - started,
                 )
                 last_checkpoint_path = output_dir / f"step_{step:08d}.pt"
                 if pending_checkpoint is not None:
@@ -880,6 +977,8 @@ def run_training(cfg: DictConfig) -> None:
             val_keys=val_keys,
             wandb_state=logger.wandb_state(),
             alignment_state=alignment_state,
+            comparison_identity=comparison_identity,
+            training_duration_seconds=prior_duration + time.time() - started,
         )
         last_checkpoint_path = last_path
         last_aliases = ["last", "latest"]

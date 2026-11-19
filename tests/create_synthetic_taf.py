@@ -64,7 +64,7 @@ def create_sequence(root: Path, name: str, seed: int, frames: int = 8) -> None:
         raise RuntimeError(f"Could not create synthetic video {video_path}")
     try:
         for index in range(frames):
-            image = np.full((32, 32, 3), index * 20, dtype=np.uint8)
+            image = np.full((32, 32, 3), (index * 20) % 256, dtype=np.uint8)
             writer.write(image)
     finally:
         writer.release()

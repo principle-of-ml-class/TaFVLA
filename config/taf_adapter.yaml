@@ -112,6 +112,16 @@ check:
   # Keep T=5 last so its model can be reused by the synthetic overfit check.
   window_sizes: [1, 3, 10, 5]
 
+comparison:
+  enabled: false
+  manifest: null
+  sampling_seed: 42
+  gallery_seed: 42
+  gallery_max_pairs: 256
+  min_anchor_gap: 20
+  window_sizes: [1, 3, 5, 7, 10, 20]
+  training_seeds: [42, 43, 44]
+
 hydra:
   job:
     chdir: false

@@ -23,6 +23,7 @@ def _plain_mapping(value: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
 def build_model(
     config: DictConfig | Mapping[str, Any], *, window_size: int | None = None,
     pretrained: bool | None = None,
+    tactile_initialization_seed: int | None = None,
 ) -> TaFAdapter:
     """Build the unchanged model while centralizing config adaptation."""
     data_cfg = _plain_mapping(config["data"])
@@ -44,5 +45,6 @@ def build_model(
         tactile_encoder=tactile_cfg,
         loss=loss_cfg,
         normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
+        tactile_initialization_seed=tactile_initialization_seed,
     )
 

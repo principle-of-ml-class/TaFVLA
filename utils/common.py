@@ -48,6 +48,8 @@ _CONFIG_KEYS = {
         "random_seed", "run_on_training_end", "save_local_figures",
     },
     "check": {"overfit_steps", "skip_overfit", "no_pretrained", "window_sizes"},
+    "comparison": {"enabled", "manifest", "sampling_seed", "gallery_seed", "gallery_max_pairs",
+                   "min_anchor_gap", "window_sizes", "training_seeds"},
 }
 
 
@@ -285,6 +287,31 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         raise TypeError("check.window_sizes must be a non-empty list")
     for index, size in enumerate(check.window_sizes):
         _integer(size, f"check.window_sizes[{index}]", minimum=1)
+
+    comparison = sections["comparison"]
+    _boolean(comparison.enabled, "comparison.enabled")
+    if comparison.enabled:
+        if not comparison.manifest or not isinstance(comparison.manifest, str):
+            raise ValueError("comparison.manifest is required in comparison mode")
+        if data.window_size not in comparison.window_sizes or data.window_size > tactile.max_window_size:
+            raise ValueError("data.window_size must be in comparison.window_sizes and within tactile max")
+        if training.min_same_episode_window_gap < comparison.min_anchor_gap:
+            raise ValueError("training.min_same_episode_window_gap must meet comparison.min_anchor_gap")
+        if data.stride != 1 or data.split_unit != "sequence":
+            raise ValueError("comparison mode requires stride=1 and sequence split")
+        if list(comparison.window_sizes) != [1, 3, 5, 7, 10, 20]:
+            raise ValueError("comparison.window_sizes must be [1, 3, 5, 7, 10, 20]")
+        if tactile.max_window_size < 20 or comparison.min_anchor_gap < 20:
+            raise ValueError("comparison requires tactile max_window_size and min_anchor_gap >= 20")
+    for key in ("sampling_seed", "gallery_seed"):
+        _integer(comparison[key], f"comparison.{key}", minimum=0)
+    _integer(comparison.gallery_max_pairs, "comparison.gallery_max_pairs", minimum=2)
+    _integer(comparison.min_anchor_gap, "comparison.min_anchor_gap", minimum=1)
+    for key in ("window_sizes", "training_seeds"):
+        if not comparison[key]:
+            raise ValueError(f"comparison.{key} must not be empty")
+        for value in comparison[key]:
+            _integer(value, f"comparison.{key}", minimum=1)
 
     OmegaConf.set_struct(config, True)
 

@@ -50,6 +50,8 @@ def save_checkpoint(
     normalization: dict[str, torch.Tensor], train_keys: list[str], val_keys: list[str],
     wandb_state: dict[str, Any] | None = None,
     alignment_state: dict[str, Any] | None = None,
+    comparison_identity: dict[str, Any] | None = None,
+    training_duration_seconds: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -67,6 +69,15 @@ def save_checkpoint(
         payload["wandb"] = dict(wandb_state)
     if alignment_state is not None:
         payload["alignment"] = dict(alignment_state)
+    if comparison_identity is not None:
+        payload["comparison_identity"] = dict(comparison_identity)
+        payload["model_parameters"] = {
+            "total": sum(p.numel() for p in model.parameters()),
+            "force_encoder": sum(p.numel() for p in model.force_encoder.parameters()),
+            "tactile_encoder": sum(p.numel() for p in model.tactile_encoder.parameters()),
+        }
+    if training_duration_seconds is not None:
+        payload["training_duration_seconds"] = float(training_duration_seconds)
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)

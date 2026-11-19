@@ -46,6 +46,9 @@ METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     "alignment/f2t/recall_at_1": {"goal": "max"},
     "alignment/f2t/recall_at_5": {"goal": "max"},
 }
+for _group in ("all", "loading", "unloading", "holding", "transition", "sudden_event"):
+    for _metric in ("recall_at_1", "recall_at_5", "mrr"):
+        METRIC_DEFINITIONS[f"alignment/dynamics/{_group}/{_metric}"] = {"goal": "max"}
 
 
 def finite_metrics(metrics: Mapping[str, Any]) -> dict[str, float | int]:

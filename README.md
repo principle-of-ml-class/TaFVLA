@@ -480,3 +480,88 @@ and freeze policy, MLP depth/width, latent/codebook sizes, Transformer details,
 normalization and reconstruction reduction, optimizer/schedule settings, loss
 weights/temperature, and whether to use the prose-symmetric rather than
 equation-directional InfoNCE. All are visible in `config/taf_adapter.yaml`.
+# Interaction dynamics × temporal window 비교 실험
+
+이 실험은 명시적으로 `comparison.enabled=true`일 때만 켜집니다. 기존 학습은 그대로 실행할 수 있습니다. 모델 입력 N은 `[1, 3, 5, 7, 10, 20]`이고 매 N마다 하나의 joint TaF-Adapter를 학습합니다. Force/pressure VQ-VAE와 tactile encoder는 기존 loss로 함께 학습하며, force target과 force reconstruction은 N프레임 전체입니다. ViT freeze 설정도 유지합니다. Force prediction은 학습이 끝난 체크포인트의 tactile embedding만 사용하는 별도 ridge probe입니다.
+
+## Label 준비와 공통 manifest
+
+`dataset_visualization`의 **기존 로컬 사본**에서 centered MTCC 결과를 export합니다. 이 저장소가 분류기를 학습 중에 실행하거나 다른 저장소를 clone하지 않습니다. 다음 명령의 경로는 자신의 실제 경로로 바꿉니다.
+
+```bash
+uv run --project /path/to/dataset_visualization taf-explorer classify \
+  --dataset-root /path/to/TaF-Dataset --cache-root /path/to/label-cache \
+  --config /path/to/dataset_visualization/configs/classifier.yaml --mode centered-mtcc
+
+uv run python -m script.dynamics_experiment manifest \
+  --data-root /path/to/TaF-Dataset \
+  --labels /path/to/label-cache/centered-mtcc-phase-v2/centered_labels.parquet \
+  --label-metadata /path/to/label-cache/centered-mtcc-phase-v2/centered_metadata.json \
+  --output outputs/comparison/manifest.parquet \
+  --split-seed 42 --fractions 0.8 0.1 0.1 \
+  --timestamp-tolerance 0.001 --gallery-seed 42 --gallery-max-pairs 256
+```
+
+분류 명령이 출력한 실제 `centered_labels.parquet`, `centered_metadata.json` 경로를 사용합니다. Importer는 export의 `frame_index`를 **episode 내부 0부터 시작하는 위치**로 해석하고 `episode_index`와 분리합니다. 원본 loader가 검증한 timestamp와 label의 `timestamp_anchor`를 허용 오차 내에서 대조합니다. 중복·잘못 연결된 episode·범위 밖 위치는 오류로 중단하고, 누락·timestamp 불일치·No Contact·history 부족은 manifest 옆 JSON에 사유와 수를 저장합니다. 원본 F/T와 pressure를 분류용 전처리 값으로 대체하지 않습니다.
+
+`sample_id`는 sensor/sequence/episode/anchor로 구성되어 N과 무관합니다. 공통 manifest에는 N=20의 과거 구간을 구성할 수 있는 anchor만 들어갑니다. 각 입력은 anchor `t`에 대해 `[t-N+1, ..., t]`이며 episode 경계·미래 프레임을 넘지 않습니다. Split은 sequence 단위로 한 번 저장하며 모든 N·training seed가 공유합니다. 정규화는 train에 포함된 공통 20프레임 구간의 **중복 없는 원본 프레임**으로 계산해 manifest 옆 `normalization_<manifest-id>.pt`에 공유합니다.
+
+최종 5분류 우선순위는 sudden_event → Loading → Unloading → Holding → Transition / Unknown → No Contact 제외입니다. 원본 phase와 sudden 값은 manifest에 보존합니다. `transition`은 현재 classifier의 **Transition / Unknown**입니다. 현재 sudden 진단은 고정된 **trailing 20프레임** 안의 급변 여부이며 모델 입력 N과 독립적입니다. Centered label은 미래 관측을 이용하는 **offline heuristic annotation**입니다. 평가 그룹과 metadata에만 사용하고 모델 입력에 넣지 않습니다. `centered_metadata.json`을 제공하면 분류 해시·버전·trailing 20 설정을 검증합니다.
+
+## 학습
+
+```bash
+# N·training seed 하나
+uv run python -m script.train_adapter comparison.enabled=true \
+  comparison.manifest=outputs/comparison/manifest.parquet \
+  data.root_dir=/path/to/TaF-Dataset data.window_size=5 data.split_seed=42 \
+  training.seed=42 training.min_same_episode_window_gap=20 \
+  training.batch_size=16 training.gradient_accumulation_steps=1 \
+  training.output_dir=outputs/comparison/runs wandb.enabled=false
+
+# 여섯 N × seed 하나
+uv run python -m script.train_adapter -m comparison.enabled=true \
+  comparison.manifest=outputs/comparison/manifest.parquet \
+  data.root_dir=/path/to/TaF-Dataset data.window_size=1,3,5,7,10,20 \
+  training.seed=42 training.min_same_episode_window_gap=20 \
+  training.batch_size=16 training.gradient_accumulation_steps=1 \
+  training.output_dir=outputs/comparison/runs wandb.enabled=false
+
+# 여섯 N × 세 seed (18개 학습을 실제로 시작하므로 자원을 확인한 뒤 실행)
+uv run python -m script.train_adapter -m comparison.enabled=true \
+  comparison.manifest=outputs/comparison/manifest.parquet \
+  data.root_dir=/path/to/TaF-Dataset data.window_size=1,3,5,7,10,20 \
+  training.seed=42,43,44 training.min_same_episode_window_gap=20 \
+  training.batch_size=16 training.gradient_accumulation_steps=1 \
+  training.output_dir=outputs/comparison/runs wandb.enabled=false
+```
+
+비교 모드는 실제 forward batch size를 모든 N에서 같게 유지합니다. Gradient accumulation은 InfoNCE negative 수를 늘리지 않습니다. 고정 sampling seed 42와 같은 anchor 목록으로 완전한 batch만 사용하며, 같은 episode의 anchor 간격을 기본 20프레임 이상으로 제한합니다. 구성하지 못한 표본 수와 실제 batch 크기는 `metrics.jsonl`에 기록합니다. Force 모듈의 N별 파라미터 수는 구조상 달라집니다. Tactile 모듈 초기화 난수는 force 모듈과 분리해 같은 seed에서 같은 shape의 파라미터가 동일하게 시작합니다. 출력 폴더·W&B 이름에는 manifest ID, N, seed가 들어갑니다. 각 run은 독립 학습하고 `last.pt`가 final-step 비교 체크포인트입니다. Resume은 같은 비교 실험 식별자만 허용합니다.
+
+## 체크포인트별 평가와 결과
+
+```bash
+uv run python -m script.dynamics_experiment retrieval \
+  --checkpoint outputs/comparison/runs/XXXXXXXX_N5_seed42/last.pt \
+  --manifest outputs/comparison/manifest.parquet --split test \
+  --output outputs/comparison/results/retrieval_N5_seed42.parquet
+
+uv run python -m script.dynamics_experiment probe \
+  --checkpoint outputs/comparison/runs/XXXXXXXX_N5_seed42/last.pt \
+  --manifest outputs/comparison/manifest.parquet \
+  --output outputs/comparison/results/probe_N5_seed42.parquet
+
+uv run python -m script.dynamics_experiment aggregate \
+  --results outputs/comparison/results/*.parquet \
+  --output outputs/comparison/summary
+```
+
+위 체크포인트 경로의 XXXXXXXX은 manifest_id 앞 8자로 바꿉니다.
+
+`retrieval --split validation`도 지원합니다. Manifest 옆 `gallery_plan.json`의 sample ID와 순서는 모든 N·seed에서 같습니다. Force embedding은 **각 N의 원본 force/pressure window와 해당 모델의 force encoder**로 다시 계산합니다. 전체 gallery에서 exact-pair rank를 구한 뒤 query만 dynamics별로 집계합니다. 빈 그룹은 0점이 아니라 unavailable입니다. Query별 rank·Recall, gallery 크기, VQ code pair 중복률, tie 수가 저장됩니다. VQ 중복을 이유로 positive나 loss 정의를 바꾸지 않습니다.
+
+Probe는 tactile encoder를 freeze하고 train embedding으로만 bias 포함 ridge를 fitting합니다. Tactile embedding은 train 평균·표준편차로 표준화하고 target은 공통 train frame의 F/T 평균·표준편차로 정규화합니다. 고정 alpha 후보 `[0.01, 0.1, 1, 10, 100]` 중 validation MSE가 가장 작은 값을 선택합니다. Test는 선택 후 한 번 평가합니다. 출력 `(B,N,6)`은 원래 기록 단위로 역변환됩니다. Whole-window MAE/RMSE는 N마다 다른 과거 구간, endpoint MAE/RMSE는 공통 anchor 시점을 뜻합니다. Whole-window embedding으로 과거 force를 예측하므로 과거 각 시점의 온라인 causal 추정이 아닙니다.
+
+CSV와 Parquet에는 `sensor_configuration, sequence_id, episode_index, sample_id, model_run_id, model_window_size, contact_state`가 들어가 `dataset_visualization`의 `model_analysis` 페이지에서 읽을 수 있습니다. `contact_state`는 dynamics5입니다. `force_prediction_mae`는 **6축 전체 원소 평균**으로 축별 단위가 섞인 수치이므로 물리적 크기 비교에는 `force_mae`(앞 3축), `torque_mae`(뒤 3축), `axis_0..5_mae`를 따로 사용합니다. 실제 F/T 단위는 데이터 `meta/info.json`의 명시된 항목으로 확인하며 없으면 `force_torque_unit_metadata`는 비어 있습니다. 집계표에는 5×6 support, N=1 대비 차이, seed 평균·표준편차와 학습·추론 시간이 들어갑니다. 그래프의 오차 막대는 seed 간 표준편차이며 겹치는 프레임을 독립 표본으로 둔 신뢰구간이 아닙니다. 참고 `model_analysis` 페이지의 자체 CI는 업로드 행을 독립으로 가정하므로 이 실험의 신뢰구간으로 인용하지 않습니다. 시간 측정은 wall clock이며 평가 시간에는 영상 decode와 데이터 로딩이 포함됩니다.
+
+작은 기능 검증: `uv run python -m unittest tests.test_dynamics_comparison -q`. 실제 label artifact와 데이터가 없는 상태에서 합성 label을 실제 연구 결과로 사용하지 마세요.

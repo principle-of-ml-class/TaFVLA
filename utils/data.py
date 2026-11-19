@@ -90,6 +90,8 @@ def audit_temporal_alignment(dataset: TaFDataset, windows_per_episode: int) -> N
 
 def compute_normalization(
     dataset: TaFDataset, train_episode_ids: set[int], chunk_frames: int, eps: float,
+    selected_indices: list[int] | None = None,
+    normalization_window_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute per-taxel/per-wrench-component population stats from train frames only."""
     if chunk_frames < 1 or eps <= 0:
@@ -99,10 +101,23 @@ def compute_normalization(
     force_sum = torch.zeros(6, dtype=torch.float64)
     force_square_sum = torch.zeros_like(force_sum)
     count = 0
+    selected_offsets: dict[int, set[int]] | None = None
+    if selected_indices is not None:
+        selected_offsets = defaultdict(set)
+        ids = {id(ep): i for i, ep in enumerate(dataset.episodes)}
+        for index in selected_indices:
+            ep, start = dataset._locate(index)
+            end = start + dataset.window_size
+            width = normalization_window_size or dataset.window_size
+            if end-width < 0:
+                raise ValueError("Normalization window crossed episode boundary")
+            selected_offsets[ids[id(ep)]].update(range(end-width, end))
     for episode_id in sorted(train_episode_ids):
         episode = dataset.episodes[episode_id]
-        for start in range(0, episode.length, chunk_frames):
-            offsets = np.arange(start, min(start + chunk_frames, episode.length), dtype=np.int64)
+        all_offsets = (np.asarray(sorted(selected_offsets[episode_id]), dtype=np.int64)
+                       if selected_offsets is not None else np.arange(episode.length, dtype=np.int64))
+        for start in range(0, len(all_offsets), chunk_frames):
+            offsets = all_offsets[start:start + chunk_frames]
             force_array, pressure_array = dataset._sensor_rows(episode, offsets)
             pressure = torch.from_numpy(pressure_array).double()
             force = torch.from_numpy(force_array).double()
