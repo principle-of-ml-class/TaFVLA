@@ -274,7 +274,10 @@ class ManifestDataset(Dataset):
         force, pressure = self.source._sensor_rows(ep, offsets)
         images, pts = self.source._images(ep, offsets)
         row = self.rows[index]
-        return {"tactile": torch.from_numpy(images).permute(0,3,1,2).contiguous().float().div_(255),
+        tactile = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
+        if getattr(self.source, "image_dtype", "float32") != "uint8":
+            tactile = tactile.float().div_(255)
+        return {"tactile": tactile,
                 "force": torch.from_numpy(force), "pressure": torch.from_numpy(pressure),
                 "metadata": {"sample_id": row["sample_id"], "dynamics5": row["dynamics5"],
                              "sensor_type": ep.sensor_type, "sequence_id": ep.sequence_id,

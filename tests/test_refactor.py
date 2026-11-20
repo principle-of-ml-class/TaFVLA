@@ -85,6 +85,17 @@ class RefactorSmokeTests(unittest.TestCase):
         self.assertTrue(config.data.timestamp_cache_enabled)
         self.assertIsNone(config.data.timestamp_cache_dir)
         self.assertTrue(config.data.show_initialization_progress)
+        throughput = compose_config(
+            "data.frame_cache_enabled=true", "data.sensor_cache_max_mb=32",
+            "training.prefetch_factor=1", "tactile_encoder.backbone_chunk_frames=64",
+        )
+        validate_config(throughput)
+        self.assertEqual(throughput.data.sensor_cache_max_mb, 32)
+        self.assertEqual(throughput.training.prefetch_factor, 1)
+        with self.assertRaisesRegex(ValueError, "frozen tactile backbone"):
+            validate_config(compose_config(
+                "data.frame_cache_enabled=true", "tactile_encoder.freeze_backbone=false"
+            ))
 
         alignment = compose_config(
             "alignment_eval.visualize_every_n_epochs=10",

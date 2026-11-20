@@ -26,6 +26,11 @@ class DataConfig:
     skip_invalid_sequences: bool = False
     timestamp_cache_enabled: bool = True
     timestamp_cache_dir: Optional[str] = None
+    sensor_cache_max_mb: int = 256
+    frame_cache_enabled: bool = False
+    frame_cache_dir: Optional[str] = None
+    frame_cache_rebuild: bool = False
+    frame_cache_batch_size: int = 32
     show_initialization_progress: bool = True
     alignment_decode_windows_per_episode: int = 1
     normalization_eps: float = 1.0e-6
@@ -57,6 +62,7 @@ class TactileEncoderConfig:
     num_heads: int = 4
     dropout: float = 0.1
     max_window_size: int = 20
+    backbone_chunk_frames: int = 0
 
 
 @dataclass
@@ -75,6 +81,7 @@ class TrainingConfig:
     weight_decay: float = 1.0e-5
     max_steps: int = 10000
     num_workers: int = 4
+    prefetch_factor: int = 2
     seed: int = 42
     amp: bool = True
     grad_clip_norm: float = 1.0
@@ -135,6 +142,38 @@ class ComparisonConfig:
 
 
 @dataclass
+class PerformanceWarningsConfig:
+    enabled: bool = False
+    data_wait_ratio_threshold: float = 0.5
+    stall_timeout_seconds: float = 600.0
+    warning_cooldown_seconds: float = 1800.0
+    cpu_rss_warning_gib: Optional[float] = None
+    gpu_reserved_warning_gib: Optional[float] = None
+    cache_hit_rate_threshold: float = 0.1
+    send_to_trainctl: bool = False
+
+
+@dataclass
+class PerformanceConfig:
+    enabled: bool = True
+    detailed_profiling: bool = False
+    log_every: int = 20
+    monitor_cpu_memory: bool = True
+    monitor_gpu_memory: bool = True
+    monitor_throughput: bool = True
+    monitor_data_loading: bool = True
+    monitor_cache: bool = False
+    monitor_gpu_utilization: bool = False
+    warnings: PerformanceWarningsConfig = field(default_factory=PerformanceWarningsConfig)
+
+
+@dataclass
+class TrainctlConfig:
+    enabled: bool = True
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
+
+
+@dataclass
 class TaFConfig:
     data: DataConfig = field(default_factory=DataConfig)
     force_encoder: ForceEncoderConfig = field(default_factory=ForceEncoderConfig)
@@ -146,6 +185,7 @@ class TaFConfig:
     alignment_eval: AlignmentEvalConfig = field(default_factory=AlignmentEvalConfig)
     check: CheckConfig = field(default_factory=CheckConfig)
     comparison: ComparisonConfig = field(default_factory=ComparisonConfig)
+    trainctl: TrainctlConfig = field(default_factory=TrainctlConfig)
 
 
 def register_config_schema() -> None:

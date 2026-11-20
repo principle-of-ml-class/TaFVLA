@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import platform
+import time
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -19,6 +22,7 @@ from utils.comparison_eval import (evaluate_probe, evaluate_retrieval, save_gall
                                    write_rows)
 from utils.dynamics import ManifestDataset, create_manifest, DYNAMICS
 from utils.model_factory import build_model
+from utils.logging import ExperimentLogger
 
 
 def source_from_config(root, data):
@@ -214,7 +218,9 @@ def main():
             ids = plan[args.split]
             if len(ids) < 2:
                 raise ValueError("Retrieval requires at least two common gallery samples")
+            evaluation_start = time.perf_counter()
             rows, report = evaluate_retrieval(model, dataset, ids, device=device, batch_size=args.batch_size)
+            evaluation_seconds = time.perf_counter() - evaluation_start
             base_rows(rows, identity, run_id, args.split, config)
             for row in rows:
                 match = rows_by_id[row["sample_id"]]
@@ -228,7 +234,9 @@ def main():
                           measurement={"device": str(device), "batch_size": args.batch_size,
                                        "includes_decode": True, "timing": "wall clock"})
         else:
+            evaluation_start = time.perf_counter()
             rows, report = evaluate_probe(model, dataset, device=device, batch_size=args.batch_size)
+            evaluation_seconds = time.perf_counter() - evaluation_start
             for split in ("validation", "test"):
                 base_rows([r for r in rows if r["split"] == split], identity, run_id, split, config)
             split_counts = Counter(r["split"] for r in rows)
@@ -244,8 +252,34 @@ def main():
             report.update(identity=identity, evaluation="tactile_only_ridge_probe",
                           measurement={"device": str(device), "batch_size": args.batch_size,
                                        "includes_decode": True, "timing": "wall clock"})
+        performance_key = ("perf/retrieval_seconds" if args.command == "retrieval"
+                           else "perf/force_prediction_seconds")
+        report["performance"] = {performance_key: evaluation_seconds}
         write_rows(rows, output)
         output.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        summary_path = Path(args.checkpoint).parent / "performance_summary.jsonl"
+        if summary_path.is_file():
+            with summary_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "record_type": "offline_evaluation", "window_size": int(identity["window_size"]),
+                    "seed": int(identity["training_seed"]), "evaluation": args.command,
+                    "split": args.split if args.command == "retrieval" else None,
+                    "duration_seconds": evaluation_seconds, "report": str(output.with_suffix(".json")),
+                    "hardware": {"host": platform.node(), "device": str(device),
+                                 "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None},
+                }, sort_keys=True) + "\n")
+        if bool(config.wandb.enabled):
+            tracking = ExperimentLogger(Path(args.checkpoint).parent, config.wandb,
+                                        checkpoint.get("wandb"))
+            try:
+                tracking.start(config, model)
+                tracking.log_wandb({performance_key: evaluation_seconds},
+                                   int(checkpoint["step"]), allow_same_step=True)
+            except Exception:
+                warnings.warn("Offline evaluation performance could not be logged to W&B",
+                              RuntimeWarning)
+            finally:
+                tracking.finish(exit_code=0)
         print(f"Wrote {len(rows)} rows to {output}")
 
 

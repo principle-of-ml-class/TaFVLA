@@ -19,6 +19,8 @@ _CONFIG_KEYS = {
         "root_dir", "window_size", "stride", "image_size", "max_sequences",
         "sensor_types", "split_seed", "split_unit", "validation_fraction",
         "skip_invalid_sequences", "timestamp_cache_enabled", "timestamp_cache_dir",
+        "sensor_cache_max_mb",
+        "frame_cache_enabled", "frame_cache_dir", "frame_cache_rebuild", "frame_cache_batch_size",
         "show_initialization_progress", "alignment_decode_windows_per_episode",
         "normalization_eps", "normalization_chunk_frames",
     },
@@ -28,12 +30,12 @@ _CONFIG_KEYS = {
     "vq": {"pressure_codebook_size", "force_codebook_size", "commitment_beta"},
     "tactile_encoder": {
         "backbone", "pretrained", "freeze_backbone", "transformer_dim",
-        "transformer_layers", "num_heads", "dropout", "max_window_size",
+        "transformer_layers", "num_heads", "dropout", "max_window_size", "backbone_chunk_frames",
     },
     "loss": {"lambda_quant", "lambda_recon", "temperature", "nce_mode"},
     "training": {
         "batch_size", "gradient_accumulation_steps", "learning_rate", "weight_decay",
-        "max_steps", "num_workers", "seed", "amp", "grad_clip_norm", "log_every",
+        "max_steps", "num_workers", "prefetch_factor", "seed", "amp", "grad_clip_norm", "log_every",
         "validate_every", "validation_batches", "save_every", "output_dir", "resume",
         "min_same_episode_window_gap",
     },
@@ -50,6 +52,7 @@ _CONFIG_KEYS = {
     "check": {"overfit_steps", "skip_overfit", "no_pretrained", "window_sizes"},
     "comparison": {"enabled", "manifest", "sampling_seed", "gallery_seed", "gallery_max_pairs",
                    "min_anchor_gap", "window_sizes", "training_seeds"},
+    "trainctl": {"enabled", "performance"},
 }
 
 
@@ -131,6 +134,37 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         if unknown:
             raise ValueError(f"Unknown config key(s) in {name}: {sorted(unknown)}")
 
+    control = sections["trainctl"]
+    _boolean(control.enabled, "trainctl.enabled")
+    perf = control.performance
+    perf_keys = {"enabled", "detailed_profiling", "log_every", "monitor_cpu_memory",
+                 "monitor_gpu_memory", "monitor_throughput", "monitor_data_loading",
+                 "monitor_cache", "monitor_gpu_utilization", "warnings"}
+    if set(perf) != perf_keys:
+        raise ValueError("trainctl.performance keys do not match the schema")
+    for key in perf_keys - {"log_every", "warnings"}:
+        _boolean(perf[key], f"trainctl.performance.{key}")
+    _integer(perf.log_every, "trainctl.performance.log_every", minimum=1)
+    warning_cfg = perf.warnings
+    warning_keys = {"enabled", "data_wait_ratio_threshold", "stall_timeout_seconds",
+                    "warning_cooldown_seconds", "cpu_rss_warning_gib",
+                    "gpu_reserved_warning_gib", "cache_hit_rate_threshold", "send_to_trainctl"}
+    if set(warning_cfg) != warning_keys:
+        raise ValueError("trainctl.performance.warnings keys do not match the schema")
+    _boolean(warning_cfg.enabled, "trainctl.performance.warnings.enabled")
+    _boolean(warning_cfg.send_to_trainctl, "trainctl.performance.warnings.send_to_trainctl")
+    for key in ("data_wait_ratio_threshold", "cache_hit_rate_threshold"):
+        _number(warning_cfg[key], f"trainctl.performance.warnings.{key}", minimum=0,
+                maximum=1)
+    for key in ("stall_timeout_seconds", "warning_cooldown_seconds"):
+        if _number(warning_cfg[key], f"trainctl.performance.warnings.{key}") <= 0:
+            raise ValueError(f"trainctl.performance.warnings.{key} must be positive")
+    for key in ("cpu_rss_warning_gib", "gpu_reserved_warning_gib"):
+        if warning_cfg[key] is not None and _number(
+            warning_cfg[key], f"trainctl.performance.warnings.{key}"
+        ) <= 0:
+            raise ValueError(f"trainctl.performance.warnings.{key} must be positive")
+
     data = sections["data"]
     if require_data_root and not data.root_dir:
         raise ValueError("data.root_dir is required for training")
@@ -159,6 +193,16 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         raise ValueError("data.validation_fraction must be between 0 and 1")
     _boolean(data.skip_invalid_sequences, "data.skip_invalid_sequences")
     _boolean(data.timestamp_cache_enabled, "data.timestamp_cache_enabled")
+    _integer(data.sensor_cache_max_mb, "data.sensor_cache_max_mb", minimum=0)
+    _boolean(data.frame_cache_enabled, "data.frame_cache_enabled")
+    _boolean(data.frame_cache_rebuild, "data.frame_cache_rebuild")
+    _integer(data.frame_cache_batch_size, "data.frame_cache_batch_size", minimum=1)
+    if data.frame_cache_dir is not None and (
+        not isinstance(data.frame_cache_dir, str) or not data.frame_cache_dir
+    ):
+        raise TypeError("data.frame_cache_dir must be null or a non-empty path string")
+    if data.frame_cache_enabled and not sections["tactile_encoder"].freeze_backbone:
+        raise ValueError("data.frame_cache_enabled requires a frozen tactile backbone")
     if data.timestamp_cache_dir is not None and (
         not isinstance(data.timestamp_cache_dir, str) or not data.timestamp_cache_dir
     ):
@@ -194,6 +238,7 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
     _number(tactile.dropout, "tactile_encoder.dropout", minimum=0.0,
             maximum=1.0, inclusive_maximum=False)
     _integer(tactile.max_window_size, "tactile_encoder.max_window_size", minimum=1)
+    _integer(tactile.backbone_chunk_frames, "tactile_encoder.backbone_chunk_frames", minimum=0)
 
     loss = sections["loss"]
     _number(loss.lambda_quant, "loss.lambda_quant", minimum=0.0)
@@ -211,6 +256,7 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
     _number(training.weight_decay, "training.weight_decay", minimum=0.0)
     _integer(training.max_steps, "training.max_steps", minimum=1)
     _integer(training.num_workers, "training.num_workers", minimum=0)
+    _integer(training.prefetch_factor, "training.prefetch_factor", minimum=1)
     _integer(training.seed, "training.seed", minimum=0)
     _boolean(training.amp, "training.amp")
     if _number(training.grad_clip_norm, "training.grad_clip_norm") <= 0:

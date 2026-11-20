@@ -193,6 +193,13 @@ class TaFAdapter(nn.Module):
         z_tactile = self.tactile_encoder.aggregate_features(tactile_features)
         return self._finish_forward(z_tactile, force_outputs, pressure_n, force_n)
 
+    def forward_from_backbone_features(
+        self, backbone_features: torch.Tensor, force: torch.Tensor, pressure: torch.Tensor
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+        """Use cached frozen ViT outputs while training projection and temporal layers."""
+        projected = self.tactile_encoder.project_backbone_features(backbone_features)
+        return self.forward_from_tactile_features(projected, force, pressure)
+
     def forward(
         self, tactile: torch.Tensor, force: torch.Tensor, pressure: torch.Tensor
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:

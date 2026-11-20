@@ -12,7 +12,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -453,6 +455,10 @@ class TaFDataset(Dataset):
         timestamp_cache_enabled: bool = True,
         timestamp_cache_dir: str | Path | None = None,
         show_initialization_progress: bool = True,
+        sensor_cache_max_bytes: int = 256 * 1024 * 1024,
+        image_dtype: str = "float32",
+        sensor_cache_shared_stats: bool = False,
+        pipeline_shared_stats: bool = False,
     ) -> None:
         # FFmpeg/PyAV may initialize native decoder state when the main process
         # audits a sample. A later POSIX fork can inherit locked native state.
@@ -468,9 +474,17 @@ class TaFDataset(Dataset):
             raise ValueError("image_size must be positive")
         if isinstance(image_size, tuple) and (len(image_size) != 2 or min(image_size) < 1):
             raise ValueError("image_size must be a positive int or (height, width)")
+        if sensor_cache_max_bytes < 0:
+            raise ValueError("sensor_cache_max_bytes must be nonnegative")
+        if image_dtype not in {"float32", "uint8"}:
+            raise ValueError("image_dtype must be 'float32' or 'uint8'")
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.window_size, self.stride, self.image_size = int(window_size), int(stride), image_size
         self.skip_invalid_sequences = skip_invalid_sequences
+        self.sensor_cache_max_bytes = int(sensor_cache_max_bytes)
+        self.image_dtype = image_dtype
+        self._sensor_shared_stats = mp.Array("q", [0, 0, 0]) if sensor_cache_shared_stats else None
+        self._pipeline_shared_stats = mp.Array("d", [0.0, 0.0, 0.0, 0.0]) if pipeline_shared_stats else None
         self.timestamp_cache_enabled = bool(timestamp_cache_enabled)
         self.timestamp_cache_dir = timestamp_cache_dir
         self.show_initialization_progress = bool(show_initialization_progress)
@@ -550,6 +564,7 @@ class TaFDataset(Dataset):
             )
         if not self.episodes:
             raise ValueError("No valid episodes remain after sequence validation")
+        self.all_episodes = list(self.episodes)
         self.episodes = [ep for ep in self.episodes if ep.length >= self.window_size]
         if not self.episodes:
             raise ValueError(f"No valid episodes are long enough for window_size={self.window_size}")
@@ -558,7 +573,9 @@ class TaFDataset(Dataset):
         for ep in self.episodes:
             total += (ep.length - self.window_size) // self.stride + 1
             self._ends.append(total)
-        self._sensor_cache: tuple[Path, dict[str, np.ndarray]] | None = None
+        self._sensor_cache: OrderedDict[Path, dict[str, np.ndarray]] = OrderedDict()
+        self._sensor_cache_bytes = 0
+        self._sensor_stats = {"parquet_reads": 0, "cache_hits": 0, "cache_misses": 0}
         self._video = None
         self._video_stream = None
         self._video_path: Path | None = None
@@ -840,14 +857,40 @@ class TaFDataset(Dataset):
 
     def _sensor_rows(self, ep: _Episode, offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         import pyarrow.parquet as pq
-        if self._sensor_cache is None or self._sensor_cache[0] != ep.parquet:
+        cache = self._sensor_cache.get(ep.parquet)
+        if cache is None:
+            self._sensor_stats["cache_misses"] += 1
+            if self._sensor_shared_stats is not None:
+                with self._sensor_shared_stats.get_lock():
+                    self._sensor_shared_stats[1] += 1
+            read_start = time.perf_counter() if self._pipeline_shared_stats is not None else None
             table = pq.read_table(ep.parquet, columns=["index", "observation.force_torque", "observation.pressure_matrix"])
-            self._sensor_cache = (ep.parquet, {
+            if read_start is not None:
+                with self._pipeline_shared_stats.get_lock():
+                    self._pipeline_shared_stats[0] += time.perf_counter() - read_start
+                    self._pipeline_shared_stats[3] += 1
+            self._sensor_stats["parquet_reads"] += 1
+            if self._sensor_shared_stats is not None:
+                with self._sensor_shared_stats.get_lock():
+                    self._sensor_shared_stats[0] += 1
+            cache = {
                 "index": np.asarray(table["index"].to_numpy(), dtype=np.int64),
                 "force": _column_matrix(table["observation.force_torque"], "observation.force_torque"),
                 "pressure": _column_matrix(table["observation.pressure_matrix"], "observation.pressure_matrix"),
-            })
-        cache = self._sensor_cache[1]
+            }
+            size = sum(array.nbytes for array in cache.values())
+            if size <= self.sensor_cache_max_bytes:
+                while self._sensor_cache and self._sensor_cache_bytes + size > self.sensor_cache_max_bytes:
+                    _, removed = self._sensor_cache.popitem(last=False)
+                    self._sensor_cache_bytes -= sum(array.nbytes for array in removed.values())
+                self._sensor_cache[ep.parquet] = cache
+                self._sensor_cache_bytes += size
+        else:
+            self._sensor_stats["cache_hits"] += 1
+            if self._sensor_shared_stats is not None:
+                with self._sensor_shared_stats.get_lock():
+                    self._sensor_shared_stats[2] += 1
+            self._sensor_cache.move_to_end(ep.parquet)
         # Episode row offset came from metadata's global index range, not the video ordinal.
         expected_indices = cache["index"][ep.row_start] + offsets
         positions = np.searchsorted(cache["index"], expected_indices)
@@ -858,6 +901,33 @@ class TaFDataset(Dataset):
         if force.shape[1] != 6 or pressure.shape[1] != 144:
             raise ValueError(f"Unexpected sensor shapes: force={force.shape}, pressure={pressure.shape}")
         return force.astype(np.float32, copy=False), pressure.reshape(-1, 12, 12).astype(np.float32, copy=False)
+
+    def sensor_cache_stats(self) -> dict[str, float | int]:
+        """Process-local counters; call within a worker for worker-specific values."""
+        stats = dict(self._sensor_stats)
+        requests = stats["cache_hits"] + stats["cache_misses"]
+        return {**stats, "hit_rate": stats["cache_hits"] / requests if requests else 0.0,
+                "bytes": self._sensor_cache_bytes, "entries": len(self._sensor_cache)}
+
+    def sensor_cache_total_stats(self) -> dict[str, float | int]:
+        """Aggregate counters from spawned workers when shared stats were enabled."""
+        if self._sensor_shared_stats is None:
+            return self.sensor_cache_stats()
+        with self._sensor_shared_stats.get_lock():
+            reads, misses, hits = list(self._sensor_shared_stats[:])
+        requests = hits + misses
+        return {"parquet_reads": reads, "cache_hits": hits, "cache_misses": misses,
+                "hit_rate": hits / requests if requests else 0.0}
+
+    def pipeline_total_stats(self) -> dict[str, float]:
+        """Sensor Parquet read and video decode wall time across workers."""
+        if self._pipeline_shared_stats is None:
+            return {"parquet_read_seconds": 0.0, "video_decode_seconds": 0.0,
+                    "video_decode_calls": 0.0, "parquet_read_calls": 0.0}
+        with self._pipeline_shared_stats.get_lock():
+            parquet, video, calls, reads = list(self._pipeline_shared_stats[:])
+        return {"parquet_read_seconds": parquet, "video_decode_seconds": video,
+                "video_decode_calls": calls, "parquet_read_calls": reads}
 
     def _close_video(self) -> None:
         """Close the PyAV container owned by the current dataset process."""
@@ -923,9 +993,14 @@ class TaFDataset(Dataset):
         Closing in finally ensures no live decoder or file descriptor reaches
         worker serialization or survives an exception.
         """
+        decode_start = time.perf_counter() if self._pipeline_shared_stats is not None else None
         try:
             return self._decode_images(ep, offsets)
         finally:
+            if decode_start is not None:
+                with self._pipeline_shared_stats.get_lock():
+                    self._pipeline_shared_stats[1] += time.perf_counter() - decode_start
+                    self._pipeline_shared_stats[2] += 1
             self._close_video()
 
     def _decode_images(self, ep: _Episode, offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -998,7 +1073,7 @@ class TaFDataset(Dataset):
         force, pressure = self._sensor_rows(ep, offsets)
         images, video_pts = self._images(ep, offsets)
         return {
-            "tactile": torch.from_numpy(images).permute(0, 3, 1, 2).contiguous().float().div_(255),
+            "tactile": self._image_tensor(images),
             "force": torch.from_numpy(force),
             "pressure": torch.from_numpy(pressure),
             "metadata": {
@@ -1012,13 +1087,19 @@ class TaFDataset(Dataset):
             },
         }
 
+    def _image_tensor(self, images: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
+        return tensor if self.image_dtype == "uint8" else tensor.float().div_(255)
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_video"] = None
         state["_video_stream"] = None
         state["_video_path"] = None
         state["_video_pid"] = None
-        state["_sensor_cache"] = None
+        state["_sensor_cache"] = OrderedDict()
+        state["_sensor_cache_bytes"] = 0
+        state["_sensor_stats"] = {"parquet_reads": 0, "cache_hits": 0, "cache_misses": 0}
         state["_video_timestamp_cache"] = {}
         return state
 

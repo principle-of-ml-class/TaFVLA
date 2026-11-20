@@ -118,6 +118,13 @@ class TrainctlTests(unittest.TestCase):
         self.assertIn("LR: 3e-05", message)
         self.assertIn("Steps: 0 → 1234", message)
         self.assertIn("Output: outputs/override", message)
+        full = build_start_message({**start_info(config), "comparison": True,
+                                    "seed": 43, "workers": 2,
+                                    "prefetch_factor": 1, "feature_cache": True})
+        self.assertIn("interaction dynamics comparison", full)
+        self.assertIn("seed: 43", full)
+        self.assertIn("workers: 2", full)
+        self.assertIn("feature cache: enabled", full)
 
     def test_validation_cache_handles_overlapping_and_nondivisible_schedules(self) -> None:
         for validate_every, save_every, total in ((500, 1000, 2000), (600, 1000, 3000)):

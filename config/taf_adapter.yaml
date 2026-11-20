@@ -20,6 +20,11 @@ data:
   timestamp_cache_enabled: true
   # null -> ${XDG_CACHE_HOME:-~/.cache}/taf-vla/video_timestamps/
   timestamp_cache_dir: null
+  sensor_cache_max_mb: 256       # Maximum per DataLoader worker.
+  frame_cache_enabled: false     # Precompute frozen ViT outputs shared by all N.
+  frame_cache_dir: null          # null -> outputs/frame_cache
+  frame_cache_rebuild: false     # Force regeneration after manual inspection.
+  frame_cache_batch_size: 32
   show_initialization_progress: true
   alignment_decode_windows_per_episode: 1
   normalization_eps: 1.0e-6
@@ -48,6 +53,7 @@ tactile_encoder:
   num_heads: 4
   dropout: 0.1
   max_window_size: 20
+  backbone_chunk_frames: 0       # Set e.g. 64 for bounded raw-image ViT memory.
 
 loss:
   lambda_quant: 1.0
@@ -64,6 +70,7 @@ training:
   weight_decay: 0.00001
   max_steps: 25000
   num_workers: 4
+  prefetch_factor: 2             # Lower this for large N and limited host RAM.
   seed: 42
   amp: true
   grad_clip_norm: 1.0
@@ -121,6 +128,28 @@ comparison:
   min_anchor_gap: 20
   window_sizes: [1, 3, 5, 7, 10, 20]
   training_seeds: [42, 43, 44]
+
+trainctl:
+  enabled: true
+  performance:
+    enabled: true
+    detailed_profiling: false   # CUDA events only when explicitly enabled.
+    log_every: 20
+    monitor_cpu_memory: true
+    monitor_gpu_memory: true
+    monitor_throughput: true
+    monitor_data_loading: true
+    monitor_cache: false        # Shared worker counters add per-sample locking.
+    monitor_gpu_utilization: false
+    warnings:
+      enabled: false
+      data_wait_ratio_threshold: 0.5
+      stall_timeout_seconds: 600
+      warning_cooldown_seconds: 1800
+      cpu_rss_warning_gib: null
+      gpu_reserved_warning_gib: null
+      cache_hit_rate_threshold: 0.1
+      send_to_trainctl: false
 
 hydra:
   job:

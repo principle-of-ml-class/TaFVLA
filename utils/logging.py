@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -39,6 +40,30 @@ WANDB_EXCLUDED_CODEBOOK_METRICS = frozenset({
 def scalar_metrics(outputs: dict[str, Any]) -> dict[str, float]:
     """모델 출력 Tensor를 파일과 화면에 기록할 Python scalar로 변환한다."""
     return {key: float(outputs[key].detach()) for key in METRIC_KEYS}
+
+
+class DeviceMetricAccumulator:
+    """Accumulate all training scalars on device; synchronize once per log interval."""
+
+    def __init__(self) -> None:
+        self.sums: dict[str, torch.Tensor] = {}
+        self.count = 0
+
+    def add(self, outputs: dict[str, Any]) -> None:
+        for key in METRIC_KEYS:
+            value = outputs[key].detach().to(torch.float64)
+            self.sums[key] = self.sums[key] + value if key in self.sums else value.clone()
+        self.count += 1
+
+    def pop_means(self, prefix: str) -> dict[str, float]:
+        if not self.count:
+            return {}
+        keys = list(METRIC_KEYS)
+        # One packed transfer waits for all metrics at the logging boundary.
+        values = torch.stack([self.sums[key] / self.count for key in keys]).cpu().tolist()
+        self.sums.clear()
+        self.count = 0
+        return {f"{prefix}/{key}": value for key, value in zip(keys, values, strict=True)}
 
 
 def filter_wandb_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -299,6 +324,7 @@ class ExperimentLogger:
         self.console_stream = console_stream if console_stream is not None else sys.stderr
         self.force_tty = force_tty
         self.progress: TrainingProgress | None = None
+        self._write_lock = threading.Lock()
 
     def start(self, full_config: DictConfig, model: torch.nn.Module) -> None:
         if not self.enabled:
@@ -325,6 +351,7 @@ class ExperimentLogger:
                 raise RuntimeError("wandb.init() returned no run")
             self.run.define_metric("global_step")
             self.run.define_metric("train/*", step_metric="global_step")
+            self.run.define_metric("perf/*", step_metric="global_step")
             self.run.define_metric("val/*", step_metric="global_step")
             self.run.define_metric("epoch", step_metric="global_step")
             self.run.define_metric("completed_epoch")
@@ -387,8 +414,9 @@ class ExperimentLogger:
     def write(self, record: dict[str, Any]) -> None:
         """전체 record를 JSONL에 보존한다. Terminal 출력은 별도 UI가 담당한다."""
         serialized = json.dumps(record, sort_keys=True)
-        with self.jsonl_path.open("a", encoding="utf-8") as handle:
-            handle.write(serialized + "\n")
+        with self._write_lock:
+            with self.jsonl_path.open("a", encoding="utf-8") as handle:
+                handle.write(serialized + "\n")
 
     def log_wandb(
         self,

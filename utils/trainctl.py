@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from numbers import Real
@@ -49,6 +50,24 @@ METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
 for _group in ("all", "loading", "unloading", "holding", "transition", "sudden_event"):
     for _metric in ("recall_at_1", "recall_at_5", "mrr"):
         METRIC_DEFINITIONS[f"alignment/dynamics/{_group}/{_metric}"] = {"goal": "max"}
+for _name in (
+    "steps_per_second", "samples_per_second", "frames_per_second",
+    "average_steps_per_second", "average_frames_per_second", "total_training_seconds",
+    "elapsed_seconds", "eta_seconds", "data_wait_ms", "data_wait_ratio",
+    "parquet_read_ms", "video_decode_ms", "h2d_transfer_ms",
+    "vit_forward_ms", "model_forward_ms", "backward_ms", "optimizer_ms",
+    "h2d_transfer_cpu_ms", "vit_forward_cpu_ms", "model_forward_cpu_ms",
+    "backward_cpu_ms", "optimizer_cpu_ms", "validation_seconds",
+    "retrieval_seconds", "alignment_retrieval_seconds",
+    "force_prediction_seconds", "checkpoint_seconds",
+    "validation_total_seconds", "retrieval_total_seconds", "alignment_retrieval_total_seconds",
+    "force_prediction_total_seconds", "checkpoint_total_seconds",
+    "gpu_peak_allocated_gib", "gpu_peak_reserved_gib", "cpu_rss_gib", "cpu_peak_rss_gib",
+    "gpu_utilization_pct", "parquet_cache_hit_rate", "parquet_cache_miss_rate",
+    "feature_cache_hit_rate",
+    "video_timestamp_cache_hit_rate",
+):
+    METRIC_DEFINITIONS[f"perf/{_name}"] = {}
 
 
 def finite_metrics(metrics: Mapping[str, Any]) -> dict[str, float | int]:
@@ -116,6 +135,10 @@ def build_start_message(info: Mapping[str, Any]) -> str:
         f"validation {info['val_windows']} windows/{info['val_groups']} groups",
         f"AMP: {info['amp']} | Device: {info['device']} | GPU: {info.get('gpu') or 'N/A'}",
         f"Backbone: {info['backbone']} | frozen: {info['freeze_backbone']}",
+        f"Mode: {'interaction dynamics comparison (loading, unloading, holding, transition, sudden_event)' if info.get('comparison') else 'standard'} | "
+        f"seed: {info.get('seed', 'N/A')} | workers: {info.get('workers', 'N/A')} | "
+        f"prefetch: {info.get('prefetch_factor', 'N/A')}",
+        f"Frozen ViT feature cache: {'enabled' if info.get('feature_cache') else 'disabled'}",
         f"Output: {info['output_dir']} | Resume: {info.get('resume') or 'none'}",
         *([f"W&B: {info['wandb_url']}"] if info.get("wandb_url") else []),
     ])
@@ -151,6 +174,21 @@ def build_checkpoint_message(info: Mapping[str, Any]) -> str:
         f"at step {info.get('best_step') if info.get('best_step') is not None else 'N/A'} | "
         f"improved vs previous best: {'yes' if info.get('improved') else 'no'}",
     ])
+    perf = info.get("performance") or {}
+    if perf:
+        lines.append(
+            f"Throughput: {_number(perf, 'perf/steps_per_second')} steps/s | "
+            f"data wait: {_number(perf, 'perf/data_wait_ms')} ms | "
+            f"CPU RSS/peak: {_number(perf, 'perf/cpu_rss_gib')}/"
+            f"{_number(perf, 'perf/cpu_peak_rss_gib')} GiB | "
+            f"GPU allocated/reserved peak: {_number(perf, 'perf/gpu_peak_allocated_gib')}/"
+            f"{_number(perf, 'perf/gpu_peak_reserved_gib')} GiB"
+        )
+        if "perf/parquet_cache_hit_rate" in perf or "perf/feature_cache_hit_rate" in perf:
+            lines.append(
+                f"Cache hit rate Parquet/feature: {_number(perf, 'perf/parquet_cache_hit_rate')} / "
+                f"{_number(perf, 'perf/feature_cache_hit_rate')}"
+            )
     return "\n".join(lines)
 
 
@@ -173,6 +211,31 @@ def build_finish_message(info: Mapping[str, Any]) -> str:
             f"{_number(alignment, 'alignment/f2t/recall_at_1')} / "
             f"{_number(alignment, 'alignment/f2t/recall_at_5')}"
         )
+    force = info.get("force_prediction")
+    if force:
+        lines.append(
+            f"Final force prediction MAE/RMSE: {_number(force, 'force_prediction_mae')} / "
+            f"{_number(force, 'force_prediction_rmse')}"
+        )
+    perf = info.get("performance") or {}
+    if perf:
+        lines.append(
+            f"Average throughput: {_number(perf, 'average_steps_per_second')} steps/s | "
+            f"CPU peak: {_number(perf, 'peak_cpu_rss_gib')} GiB | "
+            f"GPU allocated/reserved peak: {_number(perf, 'peak_gpu_allocated_gib')}/"
+            f"{_number(perf, 'peak_gpu_reserved_gib')} GiB"
+        )
+        totals = perf.get("evaluation_total_seconds") or {}
+        lines.append(
+            f"Evaluation time validation/alignment retrieval/force prediction: "
+            f"{_number(totals, 'validation')} / {_number(totals, 'alignment_retrieval')} / "
+            f"{_number(totals, 'force_prediction')} s"
+        )
+        cache = perf.get("parquet_cache") or {}
+        feature = perf.get("feature_cache") or {}
+        if cache or feature:
+            lines.append(f"Cache hit rate Parquet/feature: {_number(cache, 'hit_rate')} / "
+                         f"{_number(feature, 'hit_rate')}")
     lines.extend([
         f"Checkpoints saved this session: {info['checkpoint_count']} | Last: `{info['last_checkpoint']}`",
         f"Window size T: {info['window_size']}",
@@ -216,11 +279,12 @@ class TrainctlReporter:
     """Thin defensive facade; every call remains non-fatal and rank-zero-only."""
 
     tracker: Any = _tracker
+    enabled: bool = True
     emitted_checkpoints: set[tuple[str, int]] = field(default_factory=set)
     checkpoint_count: int = 0
 
     def _call(self, method: str, *args: Any, **kwargs: Any) -> None:
-        if self.tracker is None:
+        if not self.enabled or self.tracker is None:
             return
         try:
             getattr(self.tracker, method)(*args, **kwargs)
@@ -229,6 +293,9 @@ class TrainctlReporter:
             return
 
     def start(self, *, name: str | None, total_steps: int, message: str) -> None:
+        if self.enabled and self.tracker is None:
+            warnings.warn("trainctl is unavailable; training will continue without notifications", RuntimeWarning)
+            return
         self._call(
             "init", name=name, total_steps=total_steps,
             rank_zero_only=True, strict=False,
@@ -263,17 +330,33 @@ class TrainctlReporter:
     def fail(self, message: str) -> None:
         self._call("fail", message=redact_secrets(message))
 
+    def warn(self, message: str) -> None:
+        self._call("notify", redact_secrets(message), level="warning")
+
 
 def build_failure_message(
     exc: BaseException, *, step: int, window_size: int, checkpoint: Path | None,
     validation: Mapping[str, Any] | None, elapsed: float,
+    performance: Mapping[str, Any] | None = None,
 ) -> str:
     detail = redact_secrets(str(exc)).replace("\n", " ")[:300] or "N/A"
-    return "\n".join([
+    lines = [
         f"{type(exc).__name__}: {detail}",
         f"Last optimizer step: {step} | Window size T: {window_size}",
         f"Last checkpoint: `{checkpoint}`" if checkpoint else "Last checkpoint: N/A",
         f"Last validation loss: {_number(validation, 'val/loss_total')}",
         f"Failed: {datetime.now().astimezone().isoformat(timespec='seconds')} | "
         f"elapsed: {format_duration(elapsed)}",
-    ])
+    ]
+    if performance:
+        lines.append(
+            f"Last performance: {_number(performance, 'perf/steps_per_second')} steps/s | "
+            f"data wait: {_number(performance, 'perf/data_wait_ms')} ms | "
+            f"CPU RSS/peak: {_number(performance, 'perf/cpu_rss_gib')}/"
+            f"{_number(performance, 'perf/cpu_peak_rss_gib')} GiB | "
+            f"GPU allocated/reserved peak: {_number(performance, 'perf/gpu_peak_allocated_gib')}/"
+            f"{_number(performance, 'perf/gpu_peak_reserved_gib')} GiB"
+        )
+        if "perf/parquet_cache_hit_rate" in performance:
+            lines.append(f"Parquet cache hit rate: {_number(performance, 'perf/parquet_cache_hit_rate')}")
+    return "\n".join(lines)

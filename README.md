@@ -183,6 +183,49 @@ are `--[no-]timestamp-cache-enabled`, `--timestamp-cache-dir`, and
 `--[no-]show-initialization-progress`. Disabling the cache runs the same
 ffprobe extraction every time.
 
+### Training throughput controls
+
+Sensor Parquet values use a process-local LRU cache bounded by
+`data.sensor_cache_max_mb` per DataLoader worker. `TaFDataset.sensor_cache_stats()`
+reports reads, hits, misses, hit rate, and resident bytes for the calling
+process. Pass `sensor_cache_shared_stats=True` when constructing a dataset to
+collect worker totals with `sensor_cache_total_stats()`; this adds a small
+counter-lock cost and is used by the throughput profiler.
+
+Training DataLoaders keep images as uint8 until they reach the model, reducing
+their host-memory footprint by four times. `training.prefetch_factor` controls
+queued batches when `training.num_workers > 0`; for N=20, start with 1 and
+measure before raising workers or prefetch. The optional raw-image
+`tactile_encoder.backbone_chunk_frames` setting limits the number of frames
+converted to float32 and passed to the frozen ViT together. Keep the batch
+size required by the contrastive protocol; changing it changes the negative
+set.
+
+`data.frame_cache_enabled=true` precomputes frozen ViT outputs for each unique
+video frame. The trainable projection and temporal encoder still run on every
+step. Cache keys include backbone weights, image preprocessing, video identity,
+and aligned frame timestamps. The frame set is independent of N, so runs for
+N=1, 3, 5, 7, 10, and 20 can reuse it. Video or backbone changes invalidate
+the relevant entries. `data.frame_cache_rebuild=true` forces regeneration;
+`data.frame_cache_dir` selects the storage location. The default raw-image path
+remains available by leaving the feature cache disabled. Alignment retrieval
+continues to decode raw images and uses the same validation selection.
+
+To measure raw and cached training on the same sampled windows, with N=5 and
+N=20 by default:
+
+```bash
+uv run python -m script.profile_throughput \
+  --data-root /path/to/taf_dataset --batch-size 8 --steps 5
+```
+
+The profiler reports data loading, video decode and frozen ViT sample times,
+training step and validation time, GPU peak memory (when CUDA is available),
+process RSS, steps/s, frames/s, cache build time, and raw/cached feature error.
+Its measured speedup excludes the one-time cache build; use the reported build
+time when assessing short runs. `--no-pretrained` measures the same architecture
+with random backbone weights when pretrained weights are unavailable.
+
 Some TaF-Dataset distributions omit `meta/episodes` for otherwise complete
 sequences. The loader uses official episode metadata whenever it exists. If it
 is missing, a deliberately narrow fallback supports only one data Parquet and
@@ -365,6 +408,49 @@ Abrupt termination such as `SIGTERM` cannot produce the success annotation;
 the supervisor still reports the nonzero/terminated process. Exception text is
 credential-redacted, and finite numeric filtering prevents NaN/Inf values from
 entering trainctl. Never print or pass the webhook URL as a Hydra override.
+
+### Optional training performance telemetry
+
+`trainctl.performance.enabled=true` records training throughput, DataLoader
+wait, validation/retrieval/checkpoint duration, and process memory every
+`trainctl.performance.log_every` optimizer steps. The values go to
+`metrics.jsonl`, the existing trainctl `tracker.log()` path, and W&B under the
+same `perf/*` names when W&B is enabled. `performance_summary.jsonl` receives
+one structured row when a run finishes. No separate notifier is used.
+
+Default telemetry uses CPU wall-clock time for waiting, throughput, and
+evaluation. It does not synchronize CUDA every step. Enable
+`trainctl.performance.detailed_profiling=true` to time transfer, ViT, model
+forward, backward, and optimizer stages. On CUDA these use events and one
+synchronization at each reporting boundary; on CPU their names end in
+`_cpu_ms` to identify wall-clock measurements. Absent or unreliable measures
+are omitted. `monitor_cache=true` enables shared worker counters for Parquet
+read time and cache hit rate; the feature-cache rate describes reuse of
+precomputed video files when the cache was built. `monitor_gpu_utilization=true`
+tries the local PyTorch utilization API and omits the metric if unavailable.
+
+Warnings are off by default. Enable `trainctl.performance.warnings.enabled`
+to check data-wait share, configured CPU/GPU memory thresholds, cache hit rate,
+and optimizer-step stalls. Set `send_to_trainctl=true` to send rate-limited
+warnings through the existing trainctl notification API. Validation and
+checkpoint phases pause the stall timer.
+
+For N comparisons, collect each finished run's `performance_summary.jsonl`:
+
+```bash
+uv run python -m script.compare_performance \
+  --summaries outputs/N1/performance_summary.jsonl outputs/N3/performance_summary.jsonl \
+              outputs/N5/performance_summary.jsonl outputs/N7/performance_summary.jsonl \
+              outputs/N10/performance_summary.jsonl outputs/N20/performance_summary.jsonl \
+  --output-dir outputs/performance_comparison
+```
+
+The comparison refuses mixed hardware or training protocols, marks missing N values, and draws only
+graphs supported by measured data. Offline dynamics retrieval and force-probe
+commands record their measured durations in their JSON reports and append
+matching events to the training summary when it exists. They also log those
+`perf/*` durations to the resumed W&B run when W&B is enabled. Measure the
+passive monitor itself with `python -m script.benchmark_monitoring`.
 
 ## Cross-modal alignment evaluation
 
