@@ -12,4 +12,4 @@ wheels/
 # Experiment outputs
 wandb/
 outputs/
-.hydra/
+.hydra/metadata/centered_labels.parquet
