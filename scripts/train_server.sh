@@ -2,7 +2,7 @@
 set -e
 
 DATA_ROOT="/ssdg/spl_yeongyoo/taf_dataset"
-MANIFEST="outputs/comparison/manifest.parquet"
+MANIFEST="metadata/manifest.parquet"
 
 MID=$(uv run python -c "import pyarrow.parquet as pq; print(pq.read_table('$MANIFEST', columns=['manifest_id'])['manifest_id'][0].as_py()[:8])")
 
