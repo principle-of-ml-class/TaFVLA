@@ -515,7 +515,14 @@ class TaFDataset(Dataset):
         plans: list[_SequencePlan] = []
         for directory in candidates:
             match = re.match(r"(.+)_obj\d+$", directory.name)
-            sensor = match.group(1)
+            sensor = {
+                "gs_mini": "gs_mini_with_markers",
+                "gs_mini_wo_marker": "gs_mini_without_markers",
+                "custom_designed_no_mark": "custom_without_markers",
+                "custom_designed_6*6_mark": "custom_6x6_markers",
+                "custom_designed_7*7_mark": "custom_7x7_markers",
+                "custom_designed_8*8_mark": "custom_8x8_markers",
+            }.get(sensor, sensor)
             if allowed and sensor not in allowed:
                 continue
             try:
