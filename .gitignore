@@ -13,3 +13,4 @@ wheels/
 wandb/
 outputs/
 .hydra/metadata/centered_labels.parquet
+metadata/
