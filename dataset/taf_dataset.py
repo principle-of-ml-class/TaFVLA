@@ -513,8 +513,11 @@ class TaFDataset(Dataset):
         self.reconstructed_episode_metadata: list[str] = []
         self._video_timestamp_cache: dict[Path, np.ndarray] = {}
         plans: list[_SequencePlan] = []
+        
         for directory in candidates:
             match = re.match(r"(.+)_obj\d+$", directory.name)
+            raw_sensor = match.group(1)
+
             sensor = {
                 "gs_mini": "gs_mini_with_markers",
                 "gs_mini_wo_marker": "gs_mini_without_markers",
@@ -522,13 +525,16 @@ class TaFDataset(Dataset):
                 "custom_designed_6*6_mark": "custom_6x6_markers",
                 "custom_designed_7*7_mark": "custom_7x7_markers",
                 "custom_designed_8*8_mark": "custom_8x8_markers",
-            }.get(sensor, sensor)
+            }.get(raw_sensor, raw_sensor)
+
             if allowed and sensor not in allowed:
                 continue
+
             try:
                 plans.append(self._prepare_sequence(directory, sensor))
             except Exception as exc:
                 self._handle_invalid_sequence(directory, exc)
+
 
         referenced_videos = {
             self._metadata_video_path(plan.directory, plan.info, meta)
