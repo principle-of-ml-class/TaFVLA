@@ -115,6 +115,12 @@ class ThroughputTests(unittest.TestCase):
                                       batch_size=4)
             first_count = len(calls)
             self.assertGreater(first_count, 0)
+            # Build chunks may exceed temporal N: 21 frames with max_window=20.
+            wide = FrozenFrameCache(source, model, Path(temporary) / "wide",
+                device=torch.device("cpu"), amp_enabled=False, batch_size=32)
+            self.assertTrue(torch.allclose(wide.features(ep, np.arange(21)),
+                                           cache5.features(ep, np.arange(21)), atol=1e-6, rtol=1e-6))
+            first_count = len(calls)
             cache20 = FrozenFrameCache(source, model, Path(temporary) / "cache",
                                        device=torch.device("cpu"), amp_enabled=False,
                                        batch_size=4)
@@ -168,6 +174,39 @@ class ThroughputTests(unittest.TestCase):
                              device=torch.device("cpu"), amp_enabled=False,
                              batch_size=4)
             self.assertGreater(len(calls), first_count)
+
+    def test_frame_mmap_bound_and_subset_sidecar_do_not_change_full_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            episodes = []
+            for number in range(3):
+                video = root / f"video{number}.mp4"
+                video.write_bytes(b"identity")
+                episodes.append(SimpleNamespace(video=video, video_frame_indices=np.arange(3),
+                    video_timestamps=np.arange(3) / 30, length=3))
+            frames = np.arange(36, dtype=np.uint8).reshape(3, 2, 2, 3)
+            source = SimpleNamespace(all_episodes=episodes, image_size=(2, 2),
+                _images=lambda ep, offsets: (frames[offsets], offsets))
+            with patch("timm.create_model", return_value=_TinyBackbone()):
+                encoder = TactileEncoder(transformer_dim=4, output_dim=4,
+                    transformer_layers=1, num_heads=2, dropout=0, max_window_size=20)
+            model = SimpleNamespace(tactile_encoder=encoder)
+            full = FrozenFrameCache(source, model, root / "cache", device=torch.device("cpu"),
+                                    amp_enabled=False, max_open_files=1)
+            expected = full.features(episodes[0], np.arange(3)).clone()
+            old_array = full._arrays[episodes[0].video][1]
+            full.features(episodes[1], np.arange(3))
+            self.assertTrue(old_array._mmap.closed)
+            self.assertEqual(len(full._arrays), 1)
+            partial = FrozenFrameCache(source, model, root / "cache", device=torch.device("cpu"),
+                amp_enabled=False, selected_ordinals={episodes[0].video: {0, 2}})
+            self.assertTrue(torch.equal(full.features(episodes[0], np.arange(3)), expected))
+            self.assertTrue(torch.allclose(partial.features(episodes[0], np.array([0, 2])),
+                                           expected[[0, 2]], atol=1e-6, rtol=1e-6))
+            estimate = FrozenFrameCache.estimate(source, 4, amp_enabled=False)
+            self.assertEqual(estimate["feature_bytes"], 9 * 4 * 4)
+            full.close()
+            partial.close()
 
     def test_metric_accumulator_preserves_all_means(self):
         accumulator = DeviceMetricAccumulator()

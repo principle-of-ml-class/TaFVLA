@@ -26,7 +26,16 @@ class DataConfig:
     skip_invalid_sequences: bool = False
     timestamp_cache_enabled: bool = True
     timestamp_cache_dir: Optional[str] = None
+    sensor_arrow_conversion: bool = True
+    video_cache_max_entries: int = 2
+    batch_group_reads: bool = True
+    frame_cache_max_open_files: int = 8
     sensor_cache_max_mb: int = 256
+    sensor_mmap_enabled: bool = True
+    sensor_mmap_dir: str = "outputs/sensor_mmap"
+    sensor_mmap_rebuild: bool = False
+    sensor_mmap_max_open_files: int = 16
+    sensor_mmap_batch_rows: int = 8192
     frame_cache_enabled: bool = False
     frame_cache_dir: Optional[str] = None
     frame_cache_rebuild: bool = False
@@ -81,7 +90,7 @@ class TrainingConfig:
     weight_decay: float = 1.0e-5
     max_steps: int = 10000
     num_workers: int = 4
-    prefetch_factor: int = 2
+    prefetch_factor: int = 1
     seed: int = 42
     amp: bool = True
     grad_clip_norm: float = 1.0

@@ -19,7 +19,10 @@ _CONFIG_KEYS = {
         "root_dir", "window_size", "stride", "image_size", "max_sequences",
         "sensor_types", "split_seed", "split_unit", "validation_fraction",
         "skip_invalid_sequences", "timestamp_cache_enabled", "timestamp_cache_dir",
-        "sensor_cache_max_mb",
+        "sensor_cache_max_mb", "sensor_arrow_conversion", "video_cache_max_entries",
+        "batch_group_reads", "frame_cache_max_open_files",
+        "sensor_mmap_enabled", "sensor_mmap_dir", "sensor_mmap_rebuild",
+        "sensor_mmap_max_open_files", "sensor_mmap_batch_rows",
         "frame_cache_enabled", "frame_cache_dir", "frame_cache_rebuild", "frame_cache_batch_size",
         "show_initialization_progress", "alignment_decode_windows_per_episode",
         "normalization_eps", "normalization_chunk_frames",
@@ -194,6 +197,16 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
     _boolean(data.skip_invalid_sequences, "data.skip_invalid_sequences")
     _boolean(data.timestamp_cache_enabled, "data.timestamp_cache_enabled")
     _integer(data.sensor_cache_max_mb, "data.sensor_cache_max_mb", minimum=0)
+    _boolean(data.sensor_mmap_enabled, "data.sensor_mmap_enabled")
+    _boolean(data.sensor_mmap_rebuild, "data.sensor_mmap_rebuild")
+    _integer(data.sensor_mmap_max_open_files, "data.sensor_mmap_max_open_files", minimum=1)
+    _integer(data.sensor_mmap_batch_rows, "data.sensor_mmap_batch_rows", minimum=1)
+    if not isinstance(data.sensor_mmap_dir, str) or not data.sensor_mmap_dir:
+        raise TypeError("data.sensor_mmap_dir must be a non-empty path string")
+    _boolean(data.sensor_arrow_conversion, "data.sensor_arrow_conversion")
+    _boolean(data.batch_group_reads, "data.batch_group_reads")
+    _integer(data.video_cache_max_entries, "data.video_cache_max_entries", minimum=0)
+    _integer(data.frame_cache_max_open_files, "data.frame_cache_max_open_files", minimum=1)
     _boolean(data.frame_cache_enabled, "data.frame_cache_enabled")
     _boolean(data.frame_cache_rebuild, "data.frame_cache_rebuild")
     _integer(data.frame_cache_batch_size, "data.frame_cache_batch_size", minimum=1)

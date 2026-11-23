@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -24,6 +25,8 @@ import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from utils.live_progress import emit as progress_event
+from utils.pipeline import PipelineTelemetry
+from utils.sensor_cache import SensorMmapCache
 
 
 _TIMESTAMP_CACHE_FORMAT_VERSION = 1
@@ -81,7 +84,7 @@ def _visible_files(directory: Path, suffix: str) -> list[Path]:
     return sorted(files)
 
 
-def _column_matrix(column: Any, name: str) -> np.ndarray:
+def _column_matrix_legacy(column: Any, name: str) -> np.ndarray:
     array = column.combine_chunks()
     values = getattr(array, "values", None)
     if values is not None:
@@ -93,6 +96,36 @@ def _column_matrix(column: Any, name: str) -> np.ndarray:
         return np.stack([np.asarray(v, dtype=np.float32).reshape(-1) for v in array.to_pylist()])
     except ValueError as exc:
         raise ValueError(f"Ragged values in Parquet column {name}") from exc
+
+
+def _column_matrix(column: Any, name: str) -> np.ndarray:
+    """Flatten rectangular Arrow lists in native code; preserve legacy ragged handling."""
+    import pyarrow as pa
+    array = column.combine_chunks()
+    flat = array
+    rectangular = bool(len(array))
+    while pa.types.is_list(flat.type) or pa.types.is_large_list(flat.type) or pa.types.is_fixed_size_list(flat.type):
+        if flat.null_count:
+            rectangular = False
+            break
+        if not pa.types.is_fixed_size_list(flat.type):
+            lengths = np.diff(flat.offsets.to_numpy())
+            if len(lengths) and np.any(lengths != lengths[0]):
+                rectangular = False
+                break
+        flat = flat.flatten()
+    if rectangular and (pa.types.is_integer(flat.type) or pa.types.is_floating(flat.type)):
+        return np.asarray(flat.to_numpy(zero_copy_only=False), dtype=np.float32).reshape(len(array), -1)
+    return _column_matrix_legacy(column, name)
+
+
+def _close_video_pool(pool):
+    for container, _stream in list(pool.values()):
+        try:
+            container.close()
+        except Exception as exc:
+            warnings.warn(f"Decoder cleanup failed: {exc}", RuntimeWarning)
+    pool.clear()
 
 
 def _format_path(template: str, *, video_key: str | None, chunk: int, file: int) -> str:
@@ -474,6 +507,14 @@ class TaFDataset(Dataset):
         image_dtype: str = "float32",
         sensor_cache_shared_stats: bool = False,
         pipeline_shared_stats: bool = False,
+        detailed_profiling: bool = False,
+        sensor_arrow_conversion: bool = True,
+        video_cache_max_entries: int = 0,
+        sensor_mmap_enabled: bool = False,
+        sensor_mmap_dir: str | Path = "outputs/sensor_mmap",
+        sensor_mmap_rebuild: bool = False,
+        sensor_mmap_max_open_files: int = 16,
+        sensor_mmap_batch_rows: int = 8192,
     ) -> None:
         # FFmpeg/PyAV may initialize native decoder state when the main process
         # audits a sample. A later POSIX fork can inherit locked native state.
@@ -498,7 +539,14 @@ class TaFDataset(Dataset):
         self.skip_invalid_sequences = skip_invalid_sequences
         self.sensor_cache_max_bytes = int(sensor_cache_max_bytes)
         self.image_dtype = image_dtype
-        self._sensor_shared_stats = mp.Array("q", [0, 0, 0]) if sensor_cache_shared_stats else None
+        if video_cache_max_entries < 0:
+            raise ValueError("video_cache_max_entries must be nonnegative")
+        self.sensor_arrow_conversion = sensor_arrow_conversion
+        self.video_cache_max_entries = video_cache_max_entries
+        self._video_pool = OrderedDict()
+        self._video_finalizer = None
+        self._telemetry = PipelineTelemetry(detailed_profiling)
+        self._sensor_shared_stats = mp.Array("q", [0, 0, 0, 0, 0, 0]) if sensor_cache_shared_stats else None
         self._pipeline_shared_stats = mp.Array("d", [0.0, 0.0, 0.0, 0.0]) if pipeline_shared_stats else None
         self.timestamp_cache_enabled = bool(timestamp_cache_enabled)
         self.timestamp_cache_dir = timestamp_cache_dir
@@ -511,6 +559,18 @@ class TaFDataset(Dataset):
             sensor_types = [sensor_types]
         allowed = set(sensor_types) if sensor_types else None
         taf_root = self.root_dir if self.root_dir.name == "taf_dataset" else self.root_dir / "taf_dataset"
+        self._sensor_mmap = None
+        if sensor_mmap_enabled:
+            cache_dir = Path(sensor_mmap_dir).expanduser().resolve()
+            if cache_dir.is_relative_to(taf_root.resolve()):
+                raise ValueError("Sensor mmap cache must be outside the source TaF-Dataset directory")
+            self._sensor_mmap = SensorMmapCache(
+                cache_dir, max_open_files=sensor_mmap_max_open_files, batch_rows=sensor_mmap_batch_rows,
+                rebuild=sensor_mmap_rebuild,
+                shared_stats=sensor_cache_shared_stats or pipeline_shared_stats or detailed_profiling,
+                stats_enabled=sensor_cache_shared_stats or pipeline_shared_stats or detailed_profiling,
+                profile_page_faults=detailed_profiling,
+            )
         if not taf_root.is_dir():
             raise FileNotFoundError(f"Expected TaF data under {taf_root}")
         candidates = []
@@ -889,16 +949,46 @@ class TaFDataset(Dataset):
         previous = self._ends[ep_idx - 1] if ep_idx else 0
         return self.episodes[ep_idx], (index - previous) * self.stride
 
+    def _stage(self, name):
+        telemetry = getattr(self, "_telemetry", None)
+        return telemetry.stage(name) if telemetry is not None else contextlib.nullcontext()
+
+    def _count(self, name, value=1):
+        telemetry = getattr(self, "_telemetry", None)
+        if telemetry is not None:
+            telemetry.count(name, value)
+
+    def _sensor_counter(self, name, slot, value=1):
+        self._sensor_stats[name] = self._sensor_stats.get(name, 0) + value
+        if self._sensor_shared_stats is not None:
+            with self._sensor_shared_stats.get_lock():
+                self._sensor_shared_stats[slot] += value
+
     def _sensor_rows(self, ep: _Episode, offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mmap_cache = getattr(self, "_sensor_mmap", None)
+        if mmap_cache is not None:
+            return mmap_cache.rows(ep.parquet, ep.row_start, offsets)
         import pyarrow.parquet as pq
-        cache = self._sensor_cache.get(ep.parquet)
+        with self._stage("sensor_lookup"):
+            cache = self._sensor_cache.get(ep.parquet)
         if cache is None:
             self._sensor_stats["cache_misses"] += 1
             if self._sensor_shared_stats is not None:
                 with self._sensor_shared_stats.get_lock():
                     self._sensor_shared_stats[1] += 1
             read_start = time.perf_counter() if self._pipeline_shared_stats is not None else None
-            table = pq.read_table(ep.parquet, columns=["index", "observation.force_torque", "observation.pressure_matrix"])
+            # Separate footer/file open from column reads without changing selected columns.
+            if not getattr(self, "sensor_arrow_conversion", True):
+                with self._stage("parquet_read"):
+                    table = pq.read_table(ep.parquet, columns=["index", *self.SENSOR_COLUMNS])
+            else:
+                with self._stage("parquet_open"):
+                    parquet = pq.ParquetFile(ep.parquet)
+                try:
+                    with self._stage("parquet_read"):
+                        table = parquet.read(columns=["index", *self.SENSOR_COLUMNS])
+                finally:
+                    parquet.close()
             if read_start is not None:
                 with self._pipeline_shared_stats.get_lock():
                     self._pipeline_shared_stats[0] += time.perf_counter() - read_start
@@ -907,18 +997,28 @@ class TaFDataset(Dataset):
             if self._sensor_shared_stats is not None:
                 with self._sensor_shared_stats.get_lock():
                     self._sensor_shared_stats[0] += 1
-            cache = {
-                "index": np.asarray(table["index"].to_numpy(), dtype=np.int64),
-                "force": _column_matrix(table["observation.force_torque"], "observation.force_torque"),
-                "pressure": _column_matrix(table["observation.pressure_matrix"], "observation.pressure_matrix"),
-            }
+            converter = _column_matrix if getattr(self, "sensor_arrow_conversion", True) else _column_matrix_legacy
+            with self._stage("column_matrix"):
+                cache = {
+                    "index": np.asarray(table["index"].to_numpy(), dtype=np.int64),
+                    "force": converter(table[self.SENSOR_COLUMNS[0]], self.SENSOR_COLUMNS[0]),
+                    "pressure": converter(table[self.SENSOR_COLUMNS[1]], self.SENSOR_COLUMNS[1]),
+                }
             size = sum(array.nbytes for array in cache.values())
+            self._count("sensor_loaded_bytes", size)
+            self._sensor_counter("loaded_bytes", 5, size)
             if size <= self.sensor_cache_max_bytes:
                 while self._sensor_cache and self._sensor_cache_bytes + size > self.sensor_cache_max_bytes:
-                    _, removed = self._sensor_cache.popitem(last=False)
-                    self._sensor_cache_bytes -= sum(array.nbytes for array in removed.values())
+                    with self._stage("sensor_eviction"):
+                        _, removed = self._sensor_cache.popitem(last=False)
+                        self._sensor_cache_bytes -= sum(array.nbytes for array in removed.values())
+                    self._count("sensor_evictions")
+                    self._sensor_counter("evictions", 3)
                 self._sensor_cache[ep.parquet] = cache
                 self._sensor_cache_bytes += size
+            else:
+                self._count("sensor_oversize")
+                self._sensor_counter("oversize", 4)
         else:
             self._sensor_stats["cache_hits"] += 1
             if self._sensor_shared_stats is not None:
@@ -926,19 +1026,21 @@ class TaFDataset(Dataset):
                     self._sensor_shared_stats[2] += 1
             self._sensor_cache.move_to_end(ep.parquet)
         # Episode row offset came from metadata's global index range, not the video ordinal.
-        expected_indices = cache["index"][ep.row_start] + offsets
-        positions = np.searchsorted(cache["index"], expected_indices)
-        if np.any(positions >= len(cache["index"])) or not np.array_equal(cache["index"][positions], expected_indices):
-            raise ValueError(f"Episode {ep.episode_index} row mapping does not match dataset index")
-        force = cache["force"][positions]
-        pressure = cache["pressure"][positions]
-        if force.shape[1] != 6 or pressure.shape[1] != 144:
-            raise ValueError(f"Unexpected sensor shapes: force={force.shape}, pressure={pressure.shape}")
-        return force.astype(np.float32, copy=False), pressure.reshape(-1, 12, 12).astype(np.float32, copy=False)
+        with self._stage("frame_index_search"):
+            expected_indices = cache["index"][ep.row_start] + offsets
+            positions = np.searchsorted(cache["index"], expected_indices)
+            if np.any(positions >= len(cache["index"])) or not np.array_equal(cache["index"][positions], expected_indices):
+                raise ValueError(f"Episode {ep.episode_index} row mapping does not match dataset index")
+        with self._stage("sensor_gather"):
+            force = cache["force"][positions]
+            pressure = cache["pressure"][positions]
+            if force.shape[1] != 6 or pressure.shape[1] != 144:
+                raise ValueError(f"Unexpected sensor shapes: force={force.shape}, pressure={pressure.shape}")
+            return force.astype(np.float32, copy=False), pressure.reshape(-1, 12, 12).astype(np.float32, copy=False)
 
     def sensor_cache_stats(self) -> dict[str, float | int]:
         """Process-local counters; call within a worker for worker-specific values."""
-        stats = dict(self._sensor_stats)
+        stats = {"evictions": 0, "oversize": 0, "loaded_bytes": 0, **self._sensor_stats}
         requests = stats["cache_hits"] + stats["cache_misses"]
         return {**stats, "hit_rate": stats["cache_hits"] / requests if requests else 0.0,
                 "bytes": self._sensor_cache_bytes, "entries": len(self._sensor_cache)}
@@ -948,65 +1050,87 @@ class TaFDataset(Dataset):
         if self._sensor_shared_stats is None:
             return self.sensor_cache_stats()
         with self._sensor_shared_stats.get_lock():
-            reads, misses, hits = list(self._sensor_shared_stats[:])
+            reads, misses, hits, evictions, oversize, loaded = list(self._sensor_shared_stats[:])
         requests = hits + misses
         return {"parquet_reads": reads, "cache_hits": hits, "cache_misses": misses,
-                "hit_rate": hits / requests if requests else 0.0}
+                "hit_rate": hits / requests if requests else 0.0,
+                "evictions": evictions, "oversize": oversize, "loaded_bytes": loaded}
 
     def pipeline_total_stats(self) -> dict[str, float]:
         """Sensor Parquet read and video decode wall time across workers."""
-        if self._pipeline_shared_stats is None:
-            return {"parquet_read_seconds": 0.0, "video_decode_seconds": 0.0,
-                    "video_decode_calls": 0.0, "parquet_read_calls": 0.0}
-        with self._pipeline_shared_stats.get_lock():
-            parquet, video, calls, reads = list(self._pipeline_shared_stats[:])
-        return {"parquet_read_seconds": parquet, "video_decode_seconds": video,
-                "video_decode_calls": calls, "parquet_read_calls": reads}
+        parquet = video = calls = reads = 0.0
+        if self._pipeline_shared_stats is not None:
+            with self._pipeline_shared_stats.get_lock():
+                parquet, video, calls, reads = list(self._pipeline_shared_stats[:])
+        result = {"parquet_read_seconds": parquet, "video_decode_seconds": video,
+                  "video_decode_calls": calls, "parquet_read_calls": reads}
+        telemetry = getattr(self, "_telemetry", None)
+        if telemetry is not None and telemetry.enabled:
+            result.update(telemetry.snapshot())
+        return result
+
+    def _close_container(self, container):
+        with self._stage("video_close"):
+            container.close()
 
     def _close_video(self) -> None:
-        """Close the PyAV container owned by the current dataset process."""
-        container = getattr(self, "_video", None)
-        if container is not None:
-            try:
-                container.close()
-            except Exception:
-                # Worker shutdown must not mask the original exception.
-                pass
-        self._video = None
-        self._video_stream = None
-        self._video_path = None
-        self._video_pid = None
+        """Close every decoder owned by this process, including inactive LRU entries."""
+        pool = getattr(self, "_video_pool", {})
+        active = getattr(self, "_video", None)
+        containers = [pair[0] for pair in pool.values()]
+        if active is not None and all(active is not item for item in containers):
+            containers.append(active)
+        error = None
+        try:
+            for container in containers:
+                try:
+                    self._close_container(container)
+                except Exception as exc:
+                    error = error or exc
+        finally:
+            pool.clear()
+            self._video = self._video_stream = self._video_path = self._video_pid = None
+        if error is not None:
+            raise error
 
     def _open_video(self, path: Path):
-        """Return one process-local PyAV container and its first video stream."""
         process_id = os.getpid()
-        if self._video_pid != process_id:
-            # A dataset used before DataLoader fork can carry an inherited file
-            # descriptor. Never reuse decoder state created by another process.
+        if getattr(self, "_video_pid", None) not in (None, process_id):
             self._close_video()
-        if self._video_path != path:
-            self._close_video()
-            try:
-                import av
-            except ImportError as exc:
-                raise ImportError("TaFDataset AV1 decoding requires PyAV (`uv add av`)") from exc
-            try:
+        pool = getattr(self, "_video_pool", None)
+        if pool is None:
+            pool = self._video_pool = OrderedDict()
+        limit = getattr(self, "video_cache_max_entries", 0)
+        if path in pool:
+            self._count("video_cache_hits")
+            container, stream = pool[path]
+            pool.move_to_end(path)
+        else:
+            self._count("video_cache_misses")
+            if not limit:
+                self._close_video()
+            while limit and len(pool) >= limit:
+                _, (old, _) = pool.popitem(last=False)
+                self._close_container(old)
+                self._count("video_evictions")
+            import av
+            with self._stage("video_open"):
                 container = av.open(str(path), mode="r")
-                stream = container.streams.video[0]
-                # PyAV's FFmpeg uses a software decoder for the TaF AV1 stream.
-                # One decoder thread avoids native thread oversubscription when
-                # several spawned DataLoader workers decode at the same time.
-                stream.thread_type = "NONE"
-                stream.codec_context.thread_count = 1
-            except Exception:
-                if "container" in locals():
+                try:
+                    stream = container.streams.video[0]
+                    stream.thread_type = "NONE"
+                    stream.codec_context.thread_count = 1
+                except BaseException:
                     container.close()
-                raise
-            self._video = container
-            self._video_stream = stream
-            self._video_path = path
-            self._video_pid = process_id
-        return self._video, self._video_stream
+                    raise
+            if limit:
+                pool[path] = (container, stream)
+                if getattr(self, "_video_finalizer", None) is None:
+                    from multiprocessing.util import Finalize
+                    self._video_finalizer = Finalize(self, _close_video_pool, args=(pool,), exitpriority=10)
+        self._video, self._video_stream = container, stream
+        self._video_path, self._video_pid = path, process_id
+        return container, stream
 
     @staticmethod
     def _timestamps_to_pts(timestamps: np.ndarray, time_base: Any) -> np.ndarray:
@@ -1021,21 +1145,24 @@ class TaFDataset(Dataset):
         return pts
 
     def _images(self, ep: _Episode, offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Decode a window and close all FFmpeg state before returning.
-
-        A DataLoader may start workers after the main process inspected a sample.
-        Closing in finally ensures no live decoder or file descriptor reaches
-        worker serialization or survives an exception.
-        """
+        """Always seek by exact PTS; optionally retain bounded worker-local decoders."""
         decode_start = time.perf_counter() if self._pipeline_shared_stats is not None else None
         try:
-            return self._decode_images(ep, offsets)
+            with self._stage("video_decode"):
+                return self._decode_images(ep, offsets)
+        except BaseException:
+            try:
+                self._close_video()
+            except Exception as exc:
+                warnings.warn(f"Decoder cleanup after decode failure: {exc}", RuntimeWarning)
+            raise
         finally:
             if decode_start is not None:
                 with self._pipeline_shared_stats.get_lock():
                     self._pipeline_shared_stats[1] += time.perf_counter() - decode_start
                     self._pipeline_shared_stats[2] += 1
-            self._close_video()
+            if not getattr(self, "video_cache_max_entries", 0):
+                self._close_video()
 
     def _decode_images(self, ep: _Episode, offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Decode one temporal window from the preceding keyframe with PyAV.
@@ -1050,16 +1177,24 @@ class TaFDataset(Dataset):
         if np.any(np.diff(expected_pts) <= 0):
             raise ValueError(f"episode {ep.episode_index}: requested video PTS is not increasing")
 
-        container.seek(
-            int(expected_pts[0]),
-            backward=True,
-            any_frame=False,
-            stream=stream,
-        )
+        with self._stage("video_seek"):
+            container.seek(
+                int(expected_pts[0]),
+                backward=True,
+                any_frame=False,
+                stream=stream,
+            )
         images: list[np.ndarray] = []
         decoded_pts: list[int] = []
         wanted = 0
-        for frame in container.decode(stream):
+        decoder = iter(container.decode(stream))
+        while True:
+            try:
+                with self._stage("av1_decode"):
+                    frame = next(decoder)
+            except StopIteration:
+                break
+            self._count("decoded_frames")
             if frame.pts is None:
                 continue
             current_pts = int(frame.pts)
@@ -1071,18 +1206,19 @@ class TaFDataset(Dataset):
                     f"{int(expected_pts[wanted])} and reached {current_pts}"
                 )
 
-            if self.image_size is None:
-                rgb = frame.to_ndarray(format="rgb24")
-            else:
-                size = ((self.image_size, self.image_size)
-                        if isinstance(self.image_size, int) else self.image_size)
-                resized = frame.reformat(
-                    width=int(size[1]),
-                    height=int(size[0]),
-                    format="rgb24",
-                    interpolation="AREA",
-                )
-                rgb = resized.to_ndarray()
+            with self._stage("video_rgb"):
+                if self.image_size is None:
+                    rgb = frame.to_ndarray(format="rgb24")
+                else:
+                    size = ((self.image_size, self.image_size)
+                            if isinstance(self.image_size, int) else self.image_size)
+                    resized = frame.reformat(
+                        width=int(size[1]),
+                        height=int(size[0]),
+                        format="rgb24",
+                        interpolation="AREA",
+                    )
+                    rgb = resized.to_ndarray()
             images.append(rgb)
             decoded_pts.append(current_pts)
             wanted += 1
@@ -1099,6 +1235,10 @@ class TaFDataset(Dataset):
             raise ValueError(f"episode {ep.episode_index}: ffprobe and PyAV PTS differ")
         return np.stack(images), actual_pts
 
+    def _sensor_tensors(self, force, pressure):
+        with self._stage("sensor_tensor"):
+            return torch.from_numpy(force), torch.from_numpy(pressure)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         ep, start = self._locate(index)
         offsets = np.arange(start, start + self.window_size, dtype=np.int64)
@@ -1106,10 +1246,11 @@ class TaFDataset(Dataset):
             raise RuntimeError("Window crossed an episode boundary")
         force, pressure = self._sensor_rows(ep, offsets)
         images, video_pts = self._images(ep, offsets)
+        force_tensor, pressure_tensor = self._sensor_tensors(force, pressure)
         return {
             "tactile": self._image_tensor(images),
-            "force": torch.from_numpy(force),
-            "pressure": torch.from_numpy(pressure),
+            "force": force_tensor,
+            "pressure": pressure_tensor,
             "metadata": {
                 "sensor_type": ep.sensor_type, "sequence_id": ep.sequence_id,
                 "episode_index": ep.episode_index,
@@ -1122,11 +1263,14 @@ class TaFDataset(Dataset):
         }
 
     def _image_tensor(self, images: np.ndarray) -> torch.Tensor:
-        tensor = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
-        return tensor if self.image_dtype == "uint8" else tensor.float().div_(255)
+        with self._stage("image_tensor"):
+            tensor = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
+            return tensor if self.image_dtype == "uint8" else tensor.float().div_(255)
 
     def __getstate__(self):
         state = self.__dict__.copy()
+        state["_video_pool"] = OrderedDict()
+        state["_video_finalizer"] = None
         state["_video"] = None
         state["_video_stream"] = None
         state["_video_path"] = None
@@ -1138,4 +1282,14 @@ class TaFDataset(Dataset):
         return state
 
     def __del__(self) -> None:
-        self._close_video()
+        try:
+            self._close_video()
+        except Exception:
+            # Destructors must not mask the original exception.
+            pass
+        try:
+            mmap_cache = getattr(self, "_sensor_mmap", None)
+            if mmap_cache is not None:
+                mmap_cache.close()
+        except Exception:
+            pass

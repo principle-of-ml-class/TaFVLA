@@ -134,19 +134,29 @@ class Monitor:
         elapsed = time.monotonic() - self.started
         rate = m.get("perf/steps_per_second", 0)
         eta = (self.total_steps - step) / rate if rate else None
+        cpu_rss_key = "perf/total_rss_gib" if "perf/total_rss_gib" in m else "perf/cpu_rss_gib"
+        cpu_peak_key = ("perf/total_peak_sampled_rss_gib" if "perf/total_peak_sampled_rss_gib" in m
+                        else "perf/cpu_peak_rss_gib")
         training.add_row(f"{step}/{self.total_steps}", value("train/loss_total"), value("val/loss_total"),
                          f"{value('alignment/t2f/recall_at_1')} / {value('alignment/f2t/recall_at_1')}",
                          f"{rate:.2f} steps/s" if rate else "—",
                          f"{_duration(elapsed)} / {_duration(eta) if eta is not None else '—'}",
-                         f"{value('perf/cpu_rss_gib')} / {value('perf/cpu_peak_rss_gib')} GiB",
+                         f"{value(cpu_rss_key)} / {value(cpu_peak_key)} GiB",
                          f"{value('perf/gpu_allocated_gib')} / {value('perf/gpu_reserved_gib')} GiB")
+        pipeline = Table(title="Data pipeline", expand=True)
+        pipeline.add_column("Wait ratio / ms per batch")
+        pipeline.add_column("Parquet / video ms per call")
+        pipeline.add_column("Sensor / decoder cache hit rate")
+        pipeline.add_row(f"{value('perf/data_wait_ratio')} / {value('perf/data_wait_ms')}",
+                         f"{value('perf/parquet_read_ms')} / {value('perf/video_decode_ms')}",
+                         f"{value('perf/parquet_cache_hit_rate')} / {value('perf/video_cache_hit_rate')}")
         notes = Table(title="Current activity / recent messages", expand=True, show_header=False)
         current = next((self.stages[n] for n in reversed(STAGES)
                         if self.stages.get(n, {}).get("status") == "Running"), {})
         notes.add_row(current.get("detail") or self.phase)
         for line in self.recent:
             notes.add_row(line[-160:])
-        return Group(table, training, notes)
+        return Group(table, training, pipeline, notes)
 
     def _event(self, line: str) -> bool:
         if not line.startswith(PREFIX):

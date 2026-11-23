@@ -211,20 +211,16 @@ the relevant entries. `data.frame_cache_rebuild=true` forces regeneration;
 remains available by leaving the feature cache disabled. Alignment retrieval
 continues to decode raw images and uses the same validation selection.
 
-To measure raw and cached training on the same sampled windows, with N=5 and
-N=20 by default:
+Hydra 학습에서는 센서 mmap cache를 기본으로 사용해 반복적인 Parquet 압축 해제를 피합니다.
+`outputs/sensor_mmap`의 read-only `.npy`를 재사용하고, 없는 파일은 필요할 때 생성합니다.
+기존 Parquet+RAM LRU 경로는 `data.sensor_mmap_enabled=false`로 선택할 수 있습니다.
+생성·Cold/Warm 비교·메모리 해석은 [센서 mmap 설명](docs/dataloader_profiling.md#persistent-sensor-mmap)을 참고하세요.
 
-```bash
-uv run python -m script.profile_throughput \
-  --data-root /path/to/taf_dataset --batch-size 8 --steps 5
-```
-
-The profiler reports data loading, video decode and frozen ViT sample times,
-training step and validation time, GPU peak memory (when CUDA is available),
-process RSS, steps/s, frames/s, cache build time, and raw/cached feature error.
-Its measured speedup excludes the one-time cache build; use the reported build
-time when assessing short runs. `--no-pretrained` measures the same architecture
-with random backbone weights when pretrained weights are unavailable.
+동일 manifest와 정규화, 배치 크기 256을 사용하는 비교 방법은
+[DataLoader 분석 및 benchmark](docs/dataloader_profiling.md)를 참고하세요.
+`script.profile_throughput`는 초기화·warmup·정상 상태를 구분하며, 결과를
+새 출력 디렉터리의 `metrics.jsonl`에 저장합니다. 전체 캐시 생성 전에는
+`--estimate-only`로 예상 용량을 확인하세요.
 
 Some TaF-Dataset distributions omit `meta/episodes` for otherwise complete
 sequences. The loader uses official episode metadata whenever it exists. If it

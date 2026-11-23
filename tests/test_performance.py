@@ -58,6 +58,70 @@ def _config(*, detailed=False, warnings=False):
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_sensor_mmap_metrics_distinguish_initial_build_and_interval_access(self):
+        from utils.sensor_cache import SensorMmapCache
+        source = _Source()
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = SensorMmapCache(temporary)
+            source._sensor_mmap = cache
+            cache._add('builds')
+            cache._add('build_seconds', 3)
+            monitor = PerformanceMonitor(_config(), torch.device('cpu'), source=source)
+            cache._add('cache_hits', 4)
+            cache._add('load_calls', 2)
+            cache._add('load_seconds', .004)
+            cache._add('access_calls', 4)
+            cache._add('access_seconds', .008)
+            metrics = monitor.snapshot(0, 10)
+            self.assertEqual(metrics['perf/sensor_mmap_builds'], 0)
+            self.assertEqual(metrics['perf/sensor_mmap_initial_build_files'], 1)
+            self.assertEqual(metrics['perf/sensor_mmap_initial_build_seconds'], 3)
+            self.assertEqual(metrics['perf/sensor_mmap_hit_rate'], 1)
+            self.assertEqual(metrics['perf/sensor_mmap_load_ms_per_call'], 2)
+            self.assertEqual(metrics['perf/sensor_mmap_access_ms_per_call'], 2)
+            summary = monitor.summary(window_size=1, seed=42, train_windows=4, hardware={})
+            self.assertEqual(summary['sensor_mmap']['total_stats']['builds'], 1)
+            monitor.close()
+            cache.close()
+
+    def test_missing_nvml_warns_once_and_preserves_throughput(self):
+        for error in (ModuleNotFoundError("nvidia-ml-py missing"), ImportError("pynvml unavailable")):
+            with self.subTest(error=type(error).__name__):
+                config = _config()
+                config.monitor_gpu_utilization = True
+                monitor = PerformanceMonitor(config, torch.device("cuda"))
+                monitor.record_wait(.2)
+                monitor.record_iteration(1, 4, 4)
+                monitor.completed_step()
+                with patch("torch.cuda.utilization", side_effect=error) as utilization:
+                    with self.assertWarnsRegex(RuntimeWarning, "GPU utilization telemetry unavailable"):
+                        result = monitor.snapshot(1, 10)
+                    # Do not retry an unavailable optional dependency every report.
+                    with patch("utils.performance.warnings.warn") as warning:
+                        following = monitor.snapshot(1, 10)
+                    warning.assert_not_called()
+                    utilization.assert_called_once()
+                self.assertEqual(result["perf/steps_per_second"], 1)
+                self.assertEqual(result["perf/data_wait_ratio"], .2)
+                self.assertEqual(result["perf/gpu_utilization_available"], 0)
+                self.assertEqual(following["perf/gpu_utilization_available"], 0)
+                self.assertNotIn("perf/gpu_utilization_pct", result)
+                self.assertNotIn("perf/gpu_utilization_pct", monitor.last_metrics)
+                monitor.close()
+
+    def test_available_gpu_utilization_remains_sampled(self):
+        config = _config()
+        config.monitor_gpu_utilization = True
+        monitor = PerformanceMonitor(config, torch.device("cuda"))
+        with patch("torch.cuda.utilization", side_effect=[40, 60]) as utilization:
+            first = monitor.snapshot(0, 10)
+            second = monitor.snapshot(0, 10)
+        self.assertEqual(first["perf/gpu_utilization_pct"], 40)
+        self.assertEqual(second["perf/gpu_utilization_pct"], 60)
+        self.assertEqual(second["perf/gpu_utilization_available"], 1)
+        self.assertEqual(utilization.call_count, 2)
+        monitor.close()
+
     def test_interval_metrics_and_no_cuda_synchronization(self):
         source = _Source()
         monitor = PerformanceMonitor(_config(), torch.device("cpu"), source=source)
@@ -84,6 +148,25 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(monitor.last_metrics["perf/validation_seconds"], 2.5)
         self.assertEqual(monitor.summary(window_size=5, seed=42, train_windows=100,
                                          hardware={})["evaluation_total_seconds"]["validation"], 2.5)
+        monitor.close()
+
+    def test_worker_accumulation_is_distinct_from_wall_and_pin_delivery(self):
+        source = _Source()
+        source.pipeline.update(sample_prepare_seconds=0, sample_prepare_calls=0)
+        monitor = PerformanceMonitor(_config(detailed=True), torch.device("cpu"), source=source)
+        monitor.record_wait(.2)
+        monitor.record_iteration(1, 4, 4)
+        monitor.completed_step()
+        source.pipeline.update(sample_prepare_seconds=4, sample_prepare_calls=8)
+        with patch("utils.performance.time.monotonic", return_value=10):
+            monitor.record_batch(SimpleNamespace(collated_at=9.9, pin_seconds=.02))
+        metrics = monitor.snapshot(1, 10)
+        self.assertEqual(metrics["perf/worker_sample_prepare_seconds"], 4)
+        self.assertEqual(metrics["perf/worker_sample_prepare_calls"], 8)
+        self.assertEqual(metrics["perf/sample_prepare_worker_ms_per_call"], 500)
+        self.assertEqual(metrics["perf/data_wait_ratio"], .2)
+        self.assertAlmostEqual(metrics["perf/delivery_queue_ms_per_batch"], 80)
+        self.assertAlmostEqual(metrics["perf/pin_memory_ms_per_batch"], 20)
         monitor.close()
 
     def test_detailed_cpu_stage_and_rate_limited_warning(self):

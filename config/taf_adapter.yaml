@@ -20,7 +20,16 @@ data:
   timestamp_cache_enabled: true
   # null -> ${XDG_CACHE_HOME:-~/.cache}/taf-vla/video_timestamps/
   timestamp_cache_dir: null
+  sensor_arrow_conversion: true  # Native Arrow flatten; false restores legacy conversion.
+  video_cache_max_entries: 2     # Bounded decoder LRU per worker; 0 closes each call.
+  batch_group_reads: true       # Group reads inside a batch, then restore sampler order.
+  frame_cache_max_open_files: 8 # Bounded mmap handles per worker.
   sensor_cache_max_mb: 256       # Maximum per DataLoader worker.
+  sensor_mmap_enabled: true      # Reuse persistent decompressed sensors; build missing files lazily.
+  sensor_mmap_dir: "outputs/sensor_mmap"
+  sensor_mmap_rebuild: false     # Publish a new generation; preserve existing generations.
+  sensor_mmap_max_open_files: 16 # Each source has three read-only NPY mappings.
+  sensor_mmap_batch_rows: 8192   # Bounded Arrow batches during cache generation.
   frame_cache_enabled: false     # Precompute frozen ViT outputs shared by all N.
   frame_cache_dir: null          # null -> outputs/frame_cache
   frame_cache_rebuild: false     # Force regeneration after manual inspection.
@@ -70,7 +79,7 @@ training:
   weight_decay: 0.00001
   max_steps: 25000
   num_workers: 4
-  prefetch_factor: 2             # Lower this for large N and limited host RAM.
+  prefetch_factor: 1             # Bound queued image batches for large N and limited host RAM.
   seed: 42
   amp: true
   grad_clip_norm: 1.0

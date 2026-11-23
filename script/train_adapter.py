@@ -7,6 +7,7 @@ import hashlib
 import json
 import platform
 import time
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,7 @@ from utils.data import (
 from utils.logging import DeviceMetricAccumulator, ExperimentLogger, scalar_metrics
 from utils.frame_cache import CachedWindowDataset, FrozenFrameCache
 from utils.performance import PerformanceMonitor
+from utils.pipeline import PipelineDataset, PipelineCollate
 from utils.model_factory import build_model
 from utils.trainctl import (
     TrainctlReporter,
@@ -208,7 +210,15 @@ def run_training(cfg: DictConfig) -> None:
         show_initialization_progress=(bool(data_cfg.show_initialization_progress)
                                       and os.environ.get("TAF_TERMINAL_MONITOR") != "1"),
         sensor_cache_max_bytes=int(data_cfg.sensor_cache_max_mb) * 1024 * 1024,
+        sensor_mmap_enabled=bool(data_cfg.sensor_mmap_enabled),
+        sensor_mmap_dir=resolve_path(data_cfg.sensor_mmap_dir),
+        sensor_mmap_rebuild=bool(data_cfg.sensor_mmap_rebuild),
+        sensor_mmap_max_open_files=int(data_cfg.sensor_mmap_max_open_files),
+        sensor_mmap_batch_rows=int(data_cfg.sensor_mmap_batch_rows),
         image_dtype="uint8",
+        sensor_arrow_conversion=bool(data_cfg.sensor_arrow_conversion),
+        video_cache_max_entries=int(data_cfg.video_cache_max_entries),
+        detailed_profiling=bool(cfg.trainctl.performance.enabled and cfg.trainctl.performance.detailed_profiling),
         sensor_cache_shared_stats=bool(cfg.trainctl.performance.enabled and cfg.trainctl.performance.monitor_cache),
         pipeline_shared_stats=bool(cfg.trainctl.performance.enabled and cfg.trainctl.performance.monitor_data_loading),
     )
@@ -335,8 +345,14 @@ def run_training(cfg: DictConfig) -> None:
             source, model, cache_dir, device=device, amp_enabled=amp_enabled,
             batch_size=int(data_cfg.frame_cache_batch_size),
             rebuild=bool(data_cfg.frame_cache_rebuild),
+            max_open_files=int(data_cfg.frame_cache_max_open_files),
         )
         cached_dataset = CachedWindowDataset(dataset, frame_cache)
+
+    detailed_pipeline = bool(cfg.trainctl.performance.enabled and cfg.trainctl.performance.detailed_profiling)
+    if detailed_pipeline or data_cfg.batch_group_reads:
+        cached_dataset = PipelineDataset(cached_dataset, source, group_reads=bool(data_cfg.batch_group_reads))
+    collate = {"collate_fn": PipelineCollate(source, detailed=True)} if detailed_pipeline else {}
 
     progress_event("Training Sampler Initialization", total=len(train_indices))
     batch_sampler = (FixedValidationBatchSampler if comparison else TemporalDiverseBatchSampler)(
@@ -357,6 +373,7 @@ def run_training(cfg: DictConfig) -> None:
         pin_memory=device.type == "cuda",
         persistent_workers=workers > 0,
         **prefetch,
+        **collate,
     )
     validation_gap = max(
         int(data_cfg.window_size), int(train_cfg.min_same_episode_window_gap),
@@ -381,6 +398,7 @@ def run_training(cfg: DictConfig) -> None:
         persistent_workers=workers > 0,
         generator=validation_generator,
         **prefetch,
+        **collate,
     )
 
     output_dir = resolve_path(train_cfg.output_dir)
@@ -487,6 +505,7 @@ def run_training(cfg: DictConfig) -> None:
     perf = PerformanceMonitor(cfg.trainctl.performance, device, source=source,
                               frame_cache=frame_cache)
     perf.attach_backbone(model.tactile_encoder.backbone)
+    perf.attach_backbone(model.tactile_encoder.temporal, name="temporal_forward")
 
     def emit_performance_warning(message: str) -> None:
         safe = f"Performance warning at step {step}: {message}"
@@ -685,7 +704,8 @@ def run_training(cfg: DictConfig) -> None:
             epoch_completed = False
             # The sampler uses only a local RNG, so counting its deterministic
             # plan cannot perturb the actual DataLoader or training RNG.
-            epoch_batch_count = sum(1 for _ in batch_sampler)
+            epoch_batch_count = (len(batch_sampler) if isinstance(batch_sampler, FixedValidationBatchSampler)
+                                 else sum(1 for _ in batch_sampler))
             epoch_batch_number = 0
             train_iterator = iter(train_loader)
             while True:
@@ -697,6 +717,7 @@ def run_training(cfg: DictConfig) -> None:
                     break
                 if perf.enabled:
                     perf.record_wait(time.perf_counter() - iteration_start)
+                    perf.record_batch(batch)
                 epoch_batch_number += 1
                 is_last_epoch_batch = epoch_batch_number == epoch_batch_count
                 with perf.stage("h2d_transfer"):
@@ -1245,6 +1266,21 @@ def run_training(cfg: DictConfig) -> None:
         raise
     finally:
         perf.close()
+        for loader in (train_loader, val_loader, alignment_loader):
+            iterator = getattr(loader, "_iterator", None)
+            if iterator is not None:
+                try:
+                    iterator._shutdown_workers()
+                except Exception as exc:
+                    warnings.warn(f"DataLoader cleanup failed: {exc}", RuntimeWarning)
+        try:
+            source._close_video()
+            if source._sensor_mmap is not None:
+                source._sensor_mmap.close()
+            if frame_cache is not None:
+                frame_cache.close()
+        except Exception as exc:
+            warnings.warn(f"Dataset resource cleanup failed: {exc}", RuntimeWarning)
         if failed:
             logger.finish(exit_code=1)
 
