@@ -12,9 +12,17 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pyarrow>=26.0.0",
     "timm>=1.0.30",
-    "torch>=2.14.1",
+    "torch==2.14.1",
     "tqdm>=4.67",
     "trainctl[discord] @ git+https://github.com/jo49973477/secret_project_koyori.git@61d3d61d975086ee1bff6a6bdc79cc4d568cebc5",
     "umap-learn>=0.5.7",
     "wandb>=0.30.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
