@@ -16,8 +16,8 @@ def emit(stage: str, status: str = "Running", *, current: int | None = None,
         return
     import torch
 
-    with open("/proc/self/statm", encoding="ascii") as status:
-        pages = int(status.read().split()[1])
+    with open("/proc/self/statm", encoding="ascii") as statm_file:
+        pages = int(statm_file.read().split()[1])
     event = {
         "stage": stage, "status": status, "current": current, "total": total,
         "detail": detail, "time": time.time(),
