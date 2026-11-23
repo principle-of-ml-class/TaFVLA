@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
+from utils.live_progress import emit as progress_event
 
 
 _TIMESTAMP_CACHE_FORMAT_VERSION = 1
@@ -316,6 +317,9 @@ class _InitializationProgress:
         self.hits = int(initial_cache_hits)
         self.misses = video_total - self.hits if self._misses_precounted else 0
         self.failed = 0
+        self._last_event = 0.0
+        progress_event("Dataset Initialization", current=0, total=sequence_total,
+                       detail=f"timestamp cache hits={self.hits}, misses={self.misses}")
         self._plain_interval = max(1, video_total // 10) if video_total else 1
         self._sequence_bar = None
         self._video_bar = None
@@ -368,6 +372,7 @@ class _InitializationProgress:
 
     def finish_sequence(self) -> None:
         self.sequences += 1
+        self._emit_event(force=True)
         if self._sequence_bar is not None:
             self._sequence_bar.update(1)
 
@@ -387,6 +392,7 @@ class _InitializationProgress:
                 self.hits += 1
             else:
                 self.misses += 1
+        self._emit_event()
         if self._video_bar is not None:
             self._video_bar.update(1)
             self._refresh_status()
@@ -404,9 +410,18 @@ class _InitializationProgress:
         if not self._misses_precounted:
             self.misses += 1
         self.failed += 1
+        self._emit_event()
         if self._video_bar is not None:
             self._video_bar.update(1)
             self._refresh_status()
+
+    def _emit_event(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self._last_event >= 0.5:
+            progress_event("Dataset Initialization", current=self.sequences,
+                           total=self.sequence_total,
+                           detail=f"videos={self.videos}/{self.video_total}, cache hits={self.hits}, misses={self.misses}")
+            self._last_event = now
 
     def _refresh_status(self) -> None:
         if self._status_bar is not None:
@@ -514,7 +529,7 @@ class TaFDataset(Dataset):
         self._video_timestamp_cache: dict[Path, np.ndarray] = {}
         plans: list[_SequencePlan] = []
         
-        for directory in candidates:
+        for candidate_index, directory in enumerate(candidates, 1):
             match = re.match(r"(.+)_obj\d+$", directory.name)
             raw_sensor = match.group(1)
 
@@ -534,6 +549,9 @@ class TaFDataset(Dataset):
                 plans.append(self._prepare_sequence(directory, sensor))
             except Exception as exc:
                 self._handle_invalid_sequence(directory, exc)
+            if candidate_index == len(candidates) or candidate_index % max(1, len(candidates) // 20) == 0:
+                progress_event("Dataset Initialization",
+                               detail=f"sequence metadata {candidate_index}/{len(candidates)}")
 
 
         referenced_videos = {
@@ -543,10 +561,13 @@ class TaFDataset(Dataset):
         }
         # 디스크 캐시만 빠르게 검사한다. 여기서는 ffprobe를 절대 실행하지
         # 않으며, 정상 timestamp 배열은 뒤의 sequence validation에서 재사용한다.
-        for video_path in sorted(referenced_videos):
+        for video_index, video_path in enumerate(sorted(referenced_videos), 1):
             cached = self._timestamp_store.load_if_valid(video_path)
             if cached is not None:
                 self._video_timestamp_cache[video_path] = cached
+            if video_index == len(referenced_videos) or video_index % max(1, len(referenced_videos) // 20) == 0:
+                progress_event("Dataset Initialization",
+                               detail=f"timestamp cache scan {video_index}/{len(referenced_videos)}; hits={len(self._video_timestamp_cache)}")
         progress = _InitializationProgress(
             sequence_total=len(plans),
             video_total=len(referenced_videos),

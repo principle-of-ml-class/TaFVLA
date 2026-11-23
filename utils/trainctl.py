@@ -62,7 +62,7 @@ for _name in (
     "force_prediction_seconds", "checkpoint_seconds",
     "validation_total_seconds", "retrieval_total_seconds", "alignment_retrieval_total_seconds",
     "force_prediction_total_seconds", "checkpoint_total_seconds",
-    "gpu_peak_allocated_gib", "gpu_peak_reserved_gib", "cpu_rss_gib", "cpu_peak_rss_gib",
+    "gpu_allocated_gib", "gpu_reserved_gib", "gpu_peak_allocated_gib", "gpu_peak_reserved_gib", "cpu_rss_gib", "cpu_peak_rss_gib",
     "gpu_utilization_pct", "parquet_cache_hit_rate", "parquet_cache_miss_rate",
     "feature_cache_hit_rate",
     "video_timestamp_cache_hit_rate",

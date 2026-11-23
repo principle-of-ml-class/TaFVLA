@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -13,6 +14,7 @@ import torch
 from torch.utils.data import Sampler
 
 from dataset.taf_dataset import TaFDataset
+from utils.live_progress import emit as progress_event
 
 
 def episode_window_ranges(dataset: TaFDataset) -> list[range]:
@@ -69,6 +71,7 @@ def audit_temporal_alignment(dataset: TaFDataset, windows_per_episode: int) -> N
         raise ValueError("alignment_decode_windows_per_episode must be >= 1")
     ranges = episode_window_ranges(dataset)
     decoded = 0
+    last_report = time.monotonic()
     for episode_id, window_range in enumerate(ranges):
         count = len(window_range)
         offsets = np.linspace(0, count - 1, min(windows_per_episode, count), dtype=int)
@@ -85,6 +88,11 @@ def audit_temporal_alignment(dataset: TaFDataset, windows_per_episode: int) -> N
             if not torch.all(torch.diff(metadata["video_timestamps"]) > 0):
                 raise ValueError(f"Non-increasing video timestamps in episode index {episode_id}")
             decoded += 1
+        now = time.monotonic()
+        if now - last_report >= 0.5 or episode_id + 1 == len(ranges):
+            progress_event("Temporal Alignment Audit", current=episode_id + 1,
+                           total=len(ranges), detail=f"decoded windows={decoded}")
+            last_report = now
     print(f"Temporal alignment audit: PASS ({len(dataset.episodes)} episodes, {decoded} decoded windows)")
 
 
@@ -112,6 +120,11 @@ def compute_normalization(
             if end-width < 0:
                 raise ValueError("Normalization window crossed episode boundary")
             selected_offsets[ids[id(ep)]].update(range(end-width, end))
+    total_frames = (sum(len(selected_offsets[episode_id]) for episode_id in train_episode_ids)
+                    if selected_offsets is not None else
+                    sum(dataset.episodes[episode_id].length for episode_id in train_episode_ids))
+    started = time.monotonic()
+    last_report = started
     for episode_id in sorted(train_episode_ids):
         episode = dataset.episodes[episode_id]
         all_offsets = (np.asarray(sorted(selected_offsets[episode_id]), dtype=np.int64)
@@ -131,6 +144,11 @@ def compute_normalization(
             force_sum += force.sum(0)
             force_square_sum += force.square().sum(0)
             count += len(offsets)
+            now = time.monotonic()
+            if now - last_report >= 0.5 or count == total_frames:
+                progress_event("Normalization", current=count, total=total_frames,
+                               detail=f"frames; elapsed={now-started:.1f}s")
+                last_report = now
     if count < 2:
         raise ValueError("At least two training frames are required for normalization")
     pressure_mean = pressure_sum / count
@@ -155,7 +173,7 @@ class TemporalDiverseBatchSampler(Sampler[list[int]]):
 
     def __init__(
         self, dataset: TaFDataset, subset_indices: list[int], batch_size: int,
-        min_gap: int, seed: int,
+        min_gap: int, seed: int, progress_stage: str | None = None,
     ) -> None:
         if batch_size < 2:
             raise ValueError("InfoNCE training requires batch_size >= 2")
@@ -163,11 +181,16 @@ class TemporalDiverseBatchSampler(Sampler[list[int]]):
         self.min_gap = max(0, min_gap)
         self.seed = seed
         self.epoch = 0
+        self.progress_stage = progress_stage
         episode_ids = {id(episode): index for index, episode in enumerate(dataset.episodes)}
         self.items: list[tuple[int, int, int]] = []
         for local_index, global_index in enumerate(subset_indices):
             episode, start = dataset._locate(global_index)
             self.items.append((local_index, episode_ids[id(episode)], start))
+            if self.progress_stage and ((local_index + 1) % 5000 == 0 or local_index + 1 == len(subset_indices)):
+                progress_event(self.progress_stage,
+                               current=local_index + 1, total=len(subset_indices),
+                               detail="locating candidate windows")
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -223,6 +246,7 @@ def temporal_batch_violations(
     subset_indices: list[int],
     batches: list[list[int]],
     min_gap: int,
+    progress_stage: str | None = None,
 ) -> list[dict[str, int]]:
     """Return every same-episode pair that violates ``min_gap``.
 
@@ -234,6 +258,8 @@ def temporal_batch_violations(
     for local_index, global_index in enumerate(subset_indices):
         episode, start = dataset._locate(global_index)
         located[local_index] = (episode_ids[id(episode)], int(start))
+        if progress_stage and ((local_index + 1) % 5000 == 0 or local_index + 1 == len(subset_indices)):
+            progress_event(progress_stage, detail=f"checking locations {local_index + 1}/{len(subset_indices)}")
 
     violations: list[dict[str, int]] = []
     for batch_index, batch in enumerate(batches):
@@ -252,6 +278,8 @@ def temporal_batch_violations(
                         "right_window_start": right_start,
                         "window_start_gap": distance,
                     })
+        if progress_stage and ((batch_index + 1) % 500 == 0 or batch_index + 1 == len(batches)):
+            progress_event(progress_stage, detail=f"checking batches {batch_index + 1}/{len(batches)}")
     return violations
 
 
@@ -270,11 +298,12 @@ class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
         batch_size: int,
         min_gap: int,
         seed: int,
+        progress_stage: str | None = None,
     ) -> None:
-        super().__init__(dataset, subset_indices, batch_size, min_gap, seed)
+        super().__init__(dataset, subset_indices, batch_size, min_gap, seed, progress_stage)
         self._batches, dropped = self._build_fixed_batches()
         violations = temporal_batch_violations(
-            dataset, subset_indices, self._batches, self.min_gap,
+            dataset, subset_indices, self._batches, self.min_gap, self.progress_stage,
         )
         self.report = ValidationSamplingReport(
             seed=self.seed,
@@ -322,6 +351,7 @@ class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
         random.Random(self.seed).shuffle(remaining)
         batches: list[list[int]] = []
         dropped: list[tuple[int, int, int]] = []
+        last_report = time.monotonic()
 
         while len(remaining) >= self.batch_size:
             selected: list[tuple[int, int, int]] = []
@@ -336,6 +366,11 @@ class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
                 if len(selected) == self.batch_size:
                     deferred.extend(remaining[position + 1:])
                     break
+                if self.progress_stage and position % 1024 == 0:
+                    now = time.monotonic()
+                    if now - last_report >= 0.5:
+                        progress_event(self.progress_stage, detail=f"packing batch {len(batches) + 1}; scanned={position + 1}/{len(remaining)}")
+                        last_report = now
             if len(selected) == self.batch_size:
                 batches.append([item[0] for item in selected])
             else:
@@ -343,6 +378,10 @@ class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
                 # lets later candidates form batches, and the loss is reported.
                 dropped.extend(selected)
             remaining = deferred
+            if self.progress_stage and (len(batches) % 100 == 0 or len(remaining) < self.batch_size):
+                progress_event(self.progress_stage,
+                               current=len(self.items) - len(remaining), total=len(self.items),
+                               detail=f"fixed batches={len(batches)}, dropped={len(dropped)}")
 
         dropped.extend(remaining)
         return batches, dropped

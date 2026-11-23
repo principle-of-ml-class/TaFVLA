@@ -244,6 +244,8 @@ class PerformanceMonitor:
                 self.peak_cpu_gib = max(self.peak_cpu_gib, peak)
                 metrics["perf/cpu_peak_rss_gib"] = self.peak_cpu_gib
         if self.device.type == "cuda" and self.config.monitor_gpu_memory:
+            metrics["perf/gpu_allocated_gib"] = torch.cuda.memory_allocated(self.device) / _GIB
+            metrics["perf/gpu_reserved_gib"] = torch.cuda.memory_reserved(self.device) / _GIB
             allocated = torch.cuda.max_memory_allocated(self.device) / _GIB
             reserved = torch.cuda.max_memory_reserved(self.device) / _GIB
             self.peak_gpu_allocated_gib = max(self.peak_gpu_allocated_gib, allocated)

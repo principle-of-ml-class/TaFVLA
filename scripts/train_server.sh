@@ -9,7 +9,8 @@ MID=$(uv run python -c "import pyarrow.parquet as pq; print(pq.read_table('$MANI
 for N in 1 3 5 7 10 20; do
   OUT="outputs/comparison/runs/${MID}_N${N}_seed42"
 
-  uv run trainctl run \
+  uv run python -m script.terminal_monitor --metrics "$OUT/metrics.jsonl" --total-steps 40000 -- \
+    uv run trainctl run \
     --name "TaF-Adapter-N${N}-40k" \
     --checkpoint-dir "$OUT" \
     --total-steps 40000 \

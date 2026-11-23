@@ -59,6 +59,7 @@ from utils.trainctl import (
     build_finish_message,
     build_start_message,
 )
+from utils.live_progress import emit as progress_event
 
 
 register_config_schema()
@@ -189,6 +190,7 @@ def run_training(cfg: DictConfig) -> None:
     comparison = bool(cfg.comparison.enabled)
     if comparison:
         suffix = f"N{int(data_cfg.window_size)}_seed{seed}"
+    progress_event("Dataset Initialization")
     source = TaFDataset(
         resolve_path(data_cfg.root_dir),
         window_size=1 if comparison else int(data_cfg.window_size),
@@ -203,14 +205,23 @@ def run_training(cfg: DictConfig) -> None:
             if data_cfg.timestamp_cache_dir is not None
             else None
         ),
-        show_initialization_progress=bool(data_cfg.show_initialization_progress),
+        show_initialization_progress=(bool(data_cfg.show_initialization_progress)
+                                      and os.environ.get("TAF_TERMINAL_MONITOR") != "1"),
         sensor_cache_max_bytes=int(data_cfg.sensor_cache_max_mb) * 1024 * 1024,
         image_dtype="uint8",
         sensor_cache_shared_stats=bool(cfg.trainctl.performance.enabled and cfg.trainctl.performance.monitor_cache),
         pipeline_shared_stats=bool(cfg.trainctl.performance.enabled and cfg.trainctl.performance.monitor_data_loading),
     )
+    progress_event("Dataset Initialization", "Completed", detail=str(source.initialization_stats))
+    progress_event("Temporal Alignment Audit", total=len(source.episodes))
     audit_temporal_alignment(source, int(data_cfg.alignment_decode_windows_per_episode))
+    progress_event("Temporal Alignment Audit", "Completed", current=len(source.episodes),
+                   total=len(source.episodes))
+    progress_event("Manifest Loading & Validation", detail="reading manifest" if comparison else "standard mode")
     dataset = ManifestDataset(source, resolve_path(cfg.comparison.manifest), int(data_cfg.window_size)) if comparison else source
+    progress_event("Manifest Loading & Validation", "Completed",
+                   current=len(dataset.rows) if comparison else None,
+                   total=len(dataset.rows) if comparison else None)
     if comparison:
         train_indices = [i for i, r in enumerate(dataset.rows) if r["split"] == "train"]
         val_indices = [i for i, r in enumerate(dataset.rows) if r["split"] == "validation"]
@@ -253,6 +264,7 @@ def run_training(cfg: DictConfig) -> None:
     )
 
     resume_path = resolve_path(train_cfg.resume) if train_cfg.resume else None
+    progress_event("Normalization")
     checkpoint = load_checkpoint(resume_path) if resume_path else None
     if checkpoint is not None:
         if comparison and checkpoint.get("comparison_identity") != comparison_identity:
@@ -286,6 +298,9 @@ def run_training(cfg: DictConfig) -> None:
                             "normalization": normalization}, temporary)
                 temporary.replace(normalization_path)
 
+    progress_event("Normalization", "Completed")
+    progress_event("Model / Optimizer Initialization")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if comparison:
         model = build_model(cfg, tactile_initialization_seed=seed + 10_000)
@@ -309,6 +324,7 @@ def run_training(cfg: DictConfig) -> None:
         step, epoch = int(checkpoint["step"]), int(checkpoint.get("epoch", 0))
         restore_rng(checkpoint)
         print(f"Resumed {resume_path} at optimizer step {step}")
+    progress_event("Model / Optimizer Initialization", "Completed")
 
     cached_dataset = dataset
     frame_cache = None
@@ -322,13 +338,16 @@ def run_training(cfg: DictConfig) -> None:
         )
         cached_dataset = CachedWindowDataset(dataset, frame_cache)
 
+    progress_event("Training Sampler Initialization", total=len(train_indices))
     batch_sampler = (FixedValidationBatchSampler if comparison else TemporalDiverseBatchSampler)(
         dataset,
         train_indices,
         batch_size=int(train_cfg.batch_size),
         min_gap=int(train_cfg.min_same_episode_window_gap),
         seed=int(cfg.comparison.sampling_seed) if comparison else seed,
+        progress_stage="Training Sampler Initialization",
     )
+    progress_event("Training Sampler Initialization", "Completed", current=len(train_indices), total=len(train_indices))
     workers = int(train_cfg.num_workers)
     prefetch = {"prefetch_factor": int(train_cfg.prefetch_factor)} if workers else {}
     train_loader = DataLoader(
@@ -342,13 +361,16 @@ def run_training(cfg: DictConfig) -> None:
     validation_gap = max(
         int(data_cfg.window_size), int(train_cfg.min_same_episode_window_gap),
     )
+    progress_event("Validation Sampler Initialization", total=len(val_indices))
     validation_sampler = FixedValidationBatchSampler(
         dataset,
         val_indices,
         batch_size=int(train_cfg.batch_size),
         min_gap=validation_gap,
         seed=int(data_cfg.split_seed),
+        progress_stage="Validation Sampler Initialization",
     )
+    progress_event("Validation Sampler Initialization", "Completed", current=len(val_indices), total=len(val_indices))
     validation_generator = torch.Generator()
     validation_generator.manual_seed(int(data_cfg.split_seed))
     val_loader = DataLoader(
@@ -439,6 +461,7 @@ def run_training(cfg: DictConfig) -> None:
             f"seed={selection.random_seed}"
         )
 
+    progress_event("W&B / trainctl Initialization")
     config_dict = resolved_config(cfg)
     logger = ExperimentLogger(
         output_dir,
@@ -519,6 +542,7 @@ def run_training(cfg: DictConfig) -> None:
         name=wandb_state.get("run_name"), total_steps=max_steps,
         message=start_message,
     )
+    progress_event("W&B / trainctl Initialization", "Completed")
     validation_sampling_record: dict[str, Any] = {
         "record_type": "validation_sampling",
         **{
@@ -539,6 +563,7 @@ def run_training(cfg: DictConfig) -> None:
         f"seed={validation_sampler.report.seed}"
     )
     logger.start_progress(max_steps, initial_step=step)
+    progress_event("Training Ready", "Completed")
     perf.start_watchdog(emit_performance_warning)
     accumulation = int(train_cfg.gradient_accumulation_steps)
     optimizer.zero_grad(set_to_none=True)
@@ -567,6 +592,7 @@ def run_training(cfg: DictConfig) -> None:
             logger.log_wandb(metric, step, allow_same_step=True)
 
     def save_monitored_checkpoint(*args: Any, **kwargs: Any) -> None:
+        progress_event("Activity", detail=f"Saving checkpoint at step {step}")
         perf.phase(False)
         begin = time.perf_counter()
         try:
@@ -575,9 +601,11 @@ def run_training(cfg: DictConfig) -> None:
             perf.phase(True)
             raise
         publish_performance_event("checkpoint", time.perf_counter() - begin)
+        progress_event("Activity", "Completed", detail="Training")
         perf.phase(True)
 
     def run_monitored_alignment(**kwargs: Any) -> dict[str, Any]:
+        progress_event("Activity", detail=f"Retrieval at step {step}")
         perf.phase(False)
         begin = time.perf_counter()
         try:
@@ -586,6 +614,7 @@ def run_training(cfg: DictConfig) -> None:
             perf.phase(True)
             raise
         publish_performance_event("alignment_retrieval", time.perf_counter() - begin)
+        progress_event("Activity", "Completed", detail="Training")
         perf.phase(True)
         return result
 
@@ -777,6 +806,7 @@ def run_training(cfg: DictConfig) -> None:
                     perf.warn_if_needed(perf_metrics, step, emit_performance_warning)
                 if scheduled_validation or checkpoint_due:
                     def evaluate_current_step() -> dict[str, float]:
+                        progress_event("Activity", detail=f"Validation at step {step}")
                         perf.phase(False)
                         validation_start = time.perf_counter()
                         val_metrics = validate(
@@ -819,6 +849,7 @@ def run_training(cfg: DictConfig) -> None:
                         }
                         logger.write(record)
                         logger.update_validation(record)
+                        progress_event("Activity", "Completed", detail="Training")
                         model.train()
                         return record
 
@@ -1036,6 +1067,7 @@ def run_training(cfg: DictConfig) -> None:
             })
 
         def evaluate_final_step() -> dict[str, float]:
+            progress_event("Activity", detail=f"Final validation at step {step}")
             perf.phase(False)
             validation_start = time.perf_counter()
             val_metrics = validate(
@@ -1067,6 +1099,7 @@ def run_training(cfg: DictConfig) -> None:
             record = {"step": step, "epoch": epoch, **diagnostics, **val_metrics}
             logger.write(record)
             logger.update_validation(record)
+            progress_event("Activity", "Completed", detail="Training")
             model.train()
             return record
 

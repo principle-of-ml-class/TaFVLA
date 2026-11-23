@@ -236,7 +236,8 @@ class ManifestDataset(Dataset):
         counts = defaultdict(int)
         prior_position = (-1, -1)
         sequence_splits = {}
-        for row in self.rows:
+        from utils.live_progress import emit as progress_event
+        for row_index, row in enumerate(self.rows, 1):
             if row["split"] not in {"train", "validation", "test"}:
                 raise ValueError(f"Invalid manifest split: {row['split']}")
             previous_split = sequence_splits.setdefault(row["sequence_id"], row["split"])
@@ -259,6 +260,9 @@ class ManifestDataset(Dataset):
                 raise ValueError(f"Manifest source changed: {row['sample_id']}")
             self._locations.append((ep, anchor-window_size+1))
             counts[id(ep)] += 1
+            if row_index % 5000 == 0 or row_index == len(self.rows):
+                progress_event("Manifest Loading & Validation", current=row_index,
+                               total=len(self.rows), detail="anchors validated")
         # Explicit manifest order may not be episode-contiguous; samplers use _locate.
         self._ends = list(np.cumsum([counts[id(ep)] for ep in self.episodes]))
 
