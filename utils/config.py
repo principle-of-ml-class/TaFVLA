@@ -102,6 +102,8 @@ class TrainingConfig:
     output_dir: str = "outputs/taf_adapter"
     resume: Optional[str] = None
     min_same_episode_window_gap: int = 5
+    # auto preserves legacy comparison and standard training behavior.
+    batch_sampler: str = "auto"
 
 
 @dataclass

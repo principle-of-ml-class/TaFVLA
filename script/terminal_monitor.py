@@ -113,9 +113,12 @@ class Monitor:
             item = self.stages.get(name, {})
             status = item.get("status", "Pending")
             current, total = item.get("current"), item.get("total")
-            progress = f"{current}/{total}" if current is not None and total else (str(current) if current is not None else "—")
-            elapsed = now - item.get("time", now) if status == "Running" else item.get("elapsed", 0)
-            eta = elapsed * (total - current) / current if status == "Running" and current and total else None
+            progress = f"{current:,}/{total:,}" if current is not None and total else (str(current) if current is not None else "—")
+            if status == "Running" and item.get("phase"):
+                progress = f"{item['phase']}: {progress}"
+            elapsed = item.get("elapsed", 0) + (max(0, now - item.get("time", now)) if status == "Running" else 0)
+            phase_elapsed = max(0, now - item.get("phase_started", item.get("time", now)))
+            eta = phase_elapsed * max(0, total - current) / current if status == "Running" and current and total else None
             cpu = (f"{item['rss_gib']:.2f} / {item['peak_rss_gib']:.2f} GiB"
                    if "rss_gib" in item else "—")
             gpu = (f"{item['gpu_allocated_gib']:.2f} / {item['gpu_reserved_gib']:.2f} GiB"
@@ -174,6 +177,10 @@ class Monitor:
         if name not in STAGES:
             return False
         previous = self.stages.get(name, {})
+        if (previous.get("status") == "Running" and previous.get("phase", "") == event.get("phase", "")):
+            event["phase_started"] = previous.get("phase_started", previous.get("time", event["time"]))
+        else:
+            event["phase_started"] = event["time"]
         if event.get("status") == "Completed":
             for key in ("current", "total"):
                 if event.get(key) is None and previous.get(key) is not None:
@@ -189,8 +196,10 @@ class Monitor:
             self.phase = "Training"
         if not self.tty and (event.get("status") != previous.get("status")
                              or event.get("current") != previous.get("current")
+                             or event.get("phase") != previous.get("phase")
                              or event.get("detail") != previous.get("detail")):
-            print(f"[{name}] {event['status']} {event.get('current') or ''}/{event.get('total') or ''} "
+            print(f"[{name}] {event['status']} {event.get('phase', '')} "
+                  f"{event.get('current') if event.get('current') is not None else ''}/{event.get('total') or ''} "
                   f"{event.get('detail', '')}", flush=True)
         return True
 

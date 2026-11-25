@@ -42,6 +42,7 @@ from utils.checkpoint import (
 from utils.common import resolve_path, resolved_config, set_seed, validate_config
 from utils.config import register_config_schema
 from utils.data import (
+    EpochShuffledBatchSampler,
     FixedValidationBatchSampler,
     TemporalDiverseBatchSampler,
     audit_temporal_alignment,
@@ -194,6 +195,7 @@ def run_training(cfg: DictConfig) -> None:
     """Run training from a fully composed and validated Hydra config."""
     validate_config(cfg, require_data_root=True)
     train_cfg, data_cfg = cfg.training, cfg.data
+    sampler_mode = str(train_cfg.get("batch_sampler", "auto"))
     seed = int(train_cfg.seed)
     set_seed(seed)
 
@@ -269,6 +271,9 @@ def run_training(cfg: DictConfig) -> None:
                                "min_anchor_gap": int(cfg.comparison.min_anchor_gap),
                                "batch_size": int(train_cfg.batch_size),
                                "gradient_accumulation_steps": int(train_cfg.gradient_accumulation_steps)}
+        # Preserve old comparison identities when using the legacy default.
+        if sampler_mode != "auto":
+            comparison_identity["batch_sampler"] = sampler_mode
         cfg.wandb.name = f"{cfg.wandb.name}_{suffix}_{dataset.manifest_id[:8]}" if cfg.wandb.name else f"{suffix}_{dataset.manifest_id[:8]}"
     else:
         split = split_by_group(dataset, unit=str(data_cfg.split_unit),
@@ -363,11 +368,17 @@ def run_training(cfg: DictConfig) -> None:
     collate = {"collate_fn": PipelineCollate(source, detailed=True)} if detailed_pipeline else {}
 
     progress_event("Training Sampler Initialization", total=len(train_indices))
-    batch_sampler = (FixedValidationBatchSampler if comparison else TemporalDiverseBatchSampler)(
+    train_gap = int(train_cfg.min_same_episode_window_gap)
+    if sampler_mode == "epoch_shuffled":
+        sampler_class = EpochShuffledBatchSampler
+        train_gap = max(train_gap, int(data_cfg.window_size))
+    else:
+        sampler_class = FixedValidationBatchSampler if comparison else TemporalDiverseBatchSampler
+    batch_sampler = sampler_class(
         dataset,
         train_indices,
         batch_size=int(train_cfg.batch_size),
-        min_gap=int(train_cfg.min_same_episode_window_gap),
+        min_gap=train_gap,
         seed=int(cfg.comparison.sampling_seed) if comparison else seed,
         progress_stage="Training Sampler Initialization",
     )
@@ -703,6 +714,10 @@ def run_training(cfg: DictConfig) -> None:
     try:
         while step < max_steps:
             batch_sampler.set_epoch(epoch)
+            if sampler_mode == "epoch_shuffled":
+                logger.write({"record_type": "training_sampler", "epoch": epoch,
+                              "global_step": step, "mode": sampler_mode,
+                              "sampling": batch_sampler.report.as_dict()})
             model.train()
             perf.phase(True)
             epoch_completed = False

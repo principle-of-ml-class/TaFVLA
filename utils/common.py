@@ -40,7 +40,7 @@ _CONFIG_KEYS = {
         "batch_size", "gradient_accumulation_steps", "learning_rate", "weight_decay",
         "max_steps", "num_workers", "eval_num_workers", "prefetch_factor", "seed", "amp", "grad_clip_norm", "log_every",
         "validate_every", "validation_batches", "save_every", "output_dir", "resume",
-        "min_same_episode_window_gap",
+        "min_same_episode_window_gap", "batch_sampler",
     },
     "wandb": {
         "enabled", "project", "entity", "name", "group", "tags", "mode",
@@ -262,6 +262,8 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         raise ValueError("loss.nce_mode must be 'paper' or 'symmetric'")
 
     training = sections["training"]
+    if training.get("batch_sampler", "auto") not in {"auto", "epoch_shuffled"}:
+        raise ValueError("training.batch_sampler must be 'auto' or 'epoch_shuffled'")
     _integer(training.batch_size, "training.batch_size", minimum=2)
     _integer(training.gradient_accumulation_steps, "training.gradient_accumulation_steps", minimum=1)
     if _number(training.learning_rate, "training.learning_rate") <= 0:

@@ -184,13 +184,21 @@ class TemporalDiverseBatchSampler(Sampler[list[int]]):
         self.progress_stage = progress_stage
         episode_ids = {id(episode): index for index, episode in enumerate(dataset.episodes)}
         self.items: list[tuple[int, int, int]] = []
+        total = len(subset_indices)
+        last_report = time.monotonic()
+        if self.progress_stage:
+            progress_event(self.progress_stage, current=0, total=total,
+                           phase="Index", detail="locating candidate windows")
         for local_index, global_index in enumerate(subset_indices):
             episode, start = dataset._locate(global_index)
             self.items.append((local_index, episode_ids[id(episode)], start))
-            if self.progress_stage and ((local_index + 1) % 5000 == 0 or local_index + 1 == len(subset_indices)):
-                progress_event(self.progress_stage,
-                               current=local_index + 1, total=len(subset_indices),
-                               detail="locating candidate windows")
+            if self.progress_stage and ((local_index + 1) % 5000 == 0 or local_index + 1 == total):
+                now = time.monotonic()
+                if now - last_report >= 0.5 or local_index + 1 == total:
+                    progress_event(self.progress_stage,
+                                   current=local_index + 1, total=total,
+                                   phase="Index", detail="locating candidate windows")
+                    last_report = now
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -254,21 +262,41 @@ def temporal_batch_violations(
     audits the exact indices consumed by a DataLoader batch sampler.
     """
     episode_ids = {id(episode): index for index, episode in enumerate(dataset.episodes)}
-    located: dict[int, tuple[int, int]] = {}
+    # Local indices are dense; a list avoids a second hash table over every anchor.
+    located: list[tuple[int, int]] = []
+    last_report = time.monotonic()
+    if progress_stage:
+        progress_event(progress_stage, current=0, total=len(subset_indices),
+                       phase="Audit index", detail="checking source locations")
     for local_index, global_index in enumerate(subset_indices):
         episode, start = dataset._locate(global_index)
-        located[local_index] = (episode_ids[id(episode)], int(start))
+        located.append((episode_ids[id(episode)], int(start)))
         if progress_stage and ((local_index + 1) % 5000 == 0 or local_index + 1 == len(subset_indices)):
-            progress_event(progress_stage, detail=f"checking locations {local_index + 1}/{len(subset_indices)}")
+            now = time.monotonic()
+            if now - last_report >= 0.5 or local_index + 1 == len(subset_indices):
+                progress_event(progress_stage, current=local_index + 1, total=len(subset_indices),
+                               phase="Audit index", detail="checking source locations")
+                last_report = now
 
     violations: list[dict[str, int]] = []
+    if progress_stage:
+        progress_event(progress_stage, current=0, total=len(batches),
+                       phase="Audit batches", detail="checking strict temporal gaps")
+    last_report = time.monotonic()
     for batch_index, batch in enumerate(batches):
+        by_episode: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+        for offset, local in enumerate(batch):
+            episode, start = located[local]
+            by_episode[episode].append((offset, local, start))
+        # Only same-episode pairs can violate the temporal constraint.
+        # Iterate left and right positions in legacy order for identical reports.
         for left_offset, left_local in enumerate(batch):
             left_episode, left_start = located[left_local]
-            for right_local in batch[left_offset + 1:]:
-                right_episode, right_start = located[right_local]
+            for right_offset, right_local, right_start in by_episode[left_episode]:
+                if right_offset <= left_offset:
+                    continue
                 distance = abs(left_start - right_start)
-                if left_episode == right_episode and distance < min_gap:
+                if distance < min_gap:
                     violations.append({
                         "batch_index": batch_index,
                         "left_local_index": left_local,
@@ -279,7 +307,11 @@ def temporal_batch_violations(
                         "window_start_gap": distance,
                     })
         if progress_stage and ((batch_index + 1) % 500 == 0 or batch_index + 1 == len(batches)):
-            progress_event(progress_stage, detail=f"checking batches {batch_index + 1}/{len(batches)}")
+            now = time.monotonic()
+            if now - last_report >= 0.5 or batch_index + 1 == len(batches):
+                progress_event(progress_stage, current=batch_index + 1, total=len(batches),
+                               phase="Audit batches", detail=f"violating pairs={len(violations):,}")
+                last_report = now
     return violations
 
 
@@ -345,45 +377,70 @@ class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
         )
 
     def _build_fixed_batches(
-        self,
+        self, *, seed: int | None = None,
     ) -> tuple[list[list[int]], list[tuple[int, int, int]]]:
-        remaining = list(self.items)
-        random.Random(self.seed).shuffle(remaining)
+        total = len(self.items)
+        if self.progress_stage:
+            progress_event(self.progress_stage, current=0, total=total,
+                           phase="Shuffle", detail="shuffling candidates with local seed")
+        shuffled = list(self.items)
+        random.Random(self.seed if seed is None else seed).shuffle(shuffled)
+        remaining = deque(shuffled)
+        del shuffled
         batches: list[list[int]] = []
         dropped: list[tuple[int, int, int]] = []
         last_report = time.monotonic()
+        scans = 0
+        if self.progress_stage:
+            progress_event(self.progress_stage, current=0, total=total,
+                           phase="Packing", detail="building full temporal-gap batches")
 
+        # Preserve the exact legacy greedy order, including the rejected prefix.
+        # Only pop scanned candidates; never copy the unscanned suffix per batch.
         while len(remaining) >= self.batch_size:
             selected: list[tuple[int, int, int]] = []
             deferred: list[tuple[int, int, int]] = []
-            for position, item in enumerate(remaining):
-                if len(selected) < self.batch_size and self._compatible(
-                    item, selected, self.min_gap,
-                ):
+            starts_by_episode: dict[int, list[int]] = {}
+            for _ in range(len(remaining)):
+                item = remaining.popleft()
+                _, episode, start = item
+                starts = starts_by_episode.get(episode)
+                if starts is None or all(abs(start - other) >= self.min_gap for other in starts):
                     selected.append(item)
+                    if starts is None:
+                        starts_by_episode[episode] = [start]
+                    else:
+                        starts.append(start)
                 else:
                     deferred.append(item)
+                scans += 1
                 if len(selected) == self.batch_size:
-                    deferred.extend(remaining[position + 1:])
                     break
-                if self.progress_stage and position % 1024 == 0:
+                if self.progress_stage and scans % 4096 == 0:
                     now = time.monotonic()
                     if now - last_report >= 0.5:
-                        progress_event(self.progress_stage, detail=f"packing batch {len(batches) + 1}; scanned={position + 1}/{len(remaining)}")
+                        progress_event(self.progress_stage,
+                                       current=total - len(remaining) - len(deferred) - len(selected),
+                                       total=total, phase="Packing",
+                                       detail=f"batches={len(batches):,}; dropped={len(dropped):,}; scanned={scans:,}")
                         last_report = now
+            # extendleft reverses its input, so reverse the deferred prefix first.
+            remaining.extendleft(reversed(deferred))
             if len(selected) == self.batch_size:
                 batches.append([item[0] for item in selected])
             else:
-                # A maximal greedy set can be smaller than a batch. Removing it
-                # lets later candidates form batches, and the loss is reported.
                 dropped.extend(selected)
-            remaining = deferred
             if self.progress_stage and (len(batches) % 100 == 0 or len(remaining) < self.batch_size):
-                progress_event(self.progress_stage,
-                               current=len(self.items) - len(remaining), total=len(self.items),
-                               detail=f"fixed batches={len(batches)}, dropped={len(dropped)}")
+                now = time.monotonic()
+                if now - last_report >= 0.5 or len(remaining) < self.batch_size:
+                    progress_event(self.progress_stage, current=total - len(remaining), total=total,
+                                   phase="Packing", detail=f"batches={len(batches):,}; dropped={len(dropped):,}; scanned={scans:,}")
+                    last_report = now
 
         dropped.extend(remaining)
+        if self.progress_stage:
+            progress_event(self.progress_stage, current=total, total=total,
+                           phase="Packing", detail=f"batches={len(batches):,}; dropped={len(dropped):,}; scanned={scans:,}")
         return batches, dropped
 
     def set_epoch(self, epoch: int) -> None:
@@ -395,3 +452,47 @@ class FixedValidationBatchSampler(TemporalDiverseBatchSampler):
     def __iter__(self) -> Iterator[list[int]]:
         yield from (list(batch) for batch in self._batches)
 
+
+class EpochShuffledBatchSampler(FixedValidationBatchSampler):
+    """Training-only full batches, strict temporal gap, new plan each epoch.
+
+    Reuse the audited strict packing algorithm, not the fixed validation plan.
+    A local seed + epoch makes the plan reproducible across runs and window sizes
+    when the common anchors, gap, and batch size are the same.
+    """
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be nonnegative")
+        if epoch == self.epoch:
+            return
+        epoch_seed = self.seed + epoch
+        # Do not emit repeated sampler initialization progress into the training UI.
+        progress_stage = self.progress_stage
+        self.progress_stage = None
+        try:
+            batches, dropped = self._build_fixed_batches(seed=epoch_seed)
+        finally:
+            self.progress_stage = progress_stage
+        if not batches:
+            raise RuntimeError(
+                f"Epoch {epoch}: no full temporally diverse training batch "
+                f"(candidates={len(self.items)}, batch_size={self.batch_size}, "
+                f"min_gap={self.min_gap})"
+            )
+        # _build_fixed_batches only admits compatible items and full batches.
+        # Avoid a second quadratic all-pairs pass on every training epoch.
+        self._batches = batches
+        self.dropped_local_indices = [item[0] for item in dropped]
+        self.violations = []
+        self.report = ValidationSamplingReport(
+            seed=epoch_seed,
+            batch_size=self.batch_size,
+            min_window_start_gap=self.min_gap,
+            candidate_samples=len(self.items),
+            used_samples=sum(map(len, batches)),
+            dropped_samples=len(dropped),
+            batch_count=len(batches),
+            violating_batches=0,
+        )
+        self.epoch = epoch

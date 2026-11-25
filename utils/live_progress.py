@@ -8,11 +8,21 @@ import time
 
 
 PREFIX = "@@TAF_PROGRESS@@"
+_PLAIN_SAMPLER_STATE: dict[str, tuple[str, float]] = {}
 
 
 def emit(stage: str, status: str = "Running", *, current: int | None = None,
-         total: int | None = None, detail: str = "") -> None:
+         total: int | None = None, detail: str = "", phase: str = "") -> None:
     if os.environ.get("TAF_TERMINAL_MONITOR") != "1":
+        # Plain trainctl logs still expose sampler startup; no JSON/ANSI spam.
+        if stage in {"Training Sampler Initialization", "Validation Sampler Initialization"}:
+            now = time.monotonic()
+            previous_phase, previous_time = _PLAIN_SAMPLER_STATE.get(stage, ("", -float("inf")))
+            if (status != "Running" or phase != previous_phase or now - previous_time >= 5
+                    or (current is not None and current == total)):
+                count = f"{current:,}/{total:,}" if current is not None and total is not None else ""
+                print(f"[{stage}] {status} {phase} {count} {detail}".strip(), flush=True)
+                _PLAIN_SAMPLER_STATE[stage] = (phase, now)
         return
     import torch
 
@@ -20,7 +30,7 @@ def emit(stage: str, status: str = "Running", *, current: int | None = None,
         pages = int(statm_file.read().split()[1])
     event = {
         "stage": stage, "status": status, "current": current, "total": total,
-        "detail": detail, "time": time.time(),
+        "detail": detail, "phase": phase, "time": time.time(),
         "rss_gib": pages * os.sysconf("SC_PAGE_SIZE") / 2**30,
         "peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20,
     }
