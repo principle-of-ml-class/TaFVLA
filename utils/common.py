@@ -38,7 +38,7 @@ _CONFIG_KEYS = {
     "loss": {"lambda_quant", "lambda_recon", "temperature", "nce_mode"},
     "training": {
         "batch_size", "gradient_accumulation_steps", "learning_rate", "weight_decay",
-        "max_steps", "num_workers", "prefetch_factor", "seed", "amp", "grad_clip_norm", "log_every",
+        "max_steps", "num_workers", "eval_num_workers", "prefetch_factor", "seed", "amp", "grad_clip_norm", "log_every",
         "validate_every", "validation_batches", "save_every", "output_dir", "resume",
         "min_same_episode_window_gap",
     },
@@ -269,6 +269,7 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
     _number(training.weight_decay, "training.weight_decay", minimum=0.0)
     _integer(training.max_steps, "training.max_steps", minimum=1)
     _integer(training.num_workers, "training.num_workers", minimum=0)
+    _integer(training.eval_num_workers, "training.eval_num_workers", minimum=0)
     _integer(training.prefetch_factor, "training.prefetch_factor", minimum=1)
     _integer(training.seed, "training.seed", minimum=0)
     _boolean(training.amp, "training.amp")

@@ -123,8 +123,9 @@ Cache ON은 GPU batch shape와 FP16 저장 때문에 raw와 bitwise 동일하다
 ## RAM과 worker 수
 
 센서 cache는 worker당 256MiB 상한을 유지한다. worker 2/4/8의 cache 상한 합은
-train loader만 0.5/1/2GiB다. persistent validation loader도 별도 worker와 cache를
-유지하므로 추가 RAM이 들 수 있다. 파일 읽기/변환의 임시 배열, 데이터셋 metadata,
+train loader만 0.5/1/2GiB다. 평가 worker는 이제 `training.eval_num_workers=0`이 기본이다.
+이를 늘려 persistent evaluation loader를 사용하면 별도 worker/cache RAM이 든다.
+파일 읽기/변환의 임시 배열, 데이터셋 metadata,
 spawn 복사, decoder 내부 buffer, pinned batch는 이 상한 밖이다.
 
 B=256, 224×224 RGB uint8 batch는 N=1 약 36.75MiB, N=20 약 735MiB다.
@@ -148,6 +149,7 @@ worker를 늘릴수록 storage 경합·CPU oversubscription·spawn 메모리 중
 | `data.sensor_mmap_batch_rows` | `8192` |
 | `data.frame_cache_enabled` | 기존 false |
 | `training.num_workers` | `4` |
+| `training.eval_num_workers` | `0`; Validation/Alignment 전용 |
 | `training.prefetch_factor` | `1` |
 | `trainctl.performance.enabled` | 기존 true |
 | `trainctl.performance.detailed_profiling` | 기존 false; 상세 측정 시 true |
@@ -159,8 +161,9 @@ validation/checkpoint/40,000 steps/LR/optimizer/negative set/normalization은 �
 후속 N=1, batch 256, 20-step 실측에서 256MB/worker의 2 workers는 2.736초/step,
 4 workers는 1.469초/step이었다. 512MB로 늘려도 적중률은 약 78.5%로 같았다.
 따라서 학습 기본값은 4 workers, 256MB, prefetch 1로 맞췄다.
-4 workers benchmark의 합산 RSS 표본 최대는 약 21.47GiB였고, 실제 학습의
-validation/alignment persistent workers는 별도 RAM을 사용한다. 큰 N에서의 속도·메모리는 미측정이다.
+4 workers benchmark의 합산 RSS 표본 최대는 약 21.47GiB였다.
+평가 기본값은 이제 0 workers여서 추가 worker pool을 만들지 않는다. 평가 worker를
+늘리면 별도 RAM을 사용한다. 큰 N에서의 속도·메모리는 미측정이다.
 
 ## 사용자가 실행할 명령
 
@@ -369,7 +372,7 @@ N/worker 조건별 새 디렉터리를 사용하고 B와 C는 동일 디렉터�
 기본값 `--sensor-mmap off`로 기존 benchmark 모드도 그대로 사용할 수 있다.
 
 실제 학습은 추가 옵션 없이 mmap을 사용한다. 기존 `train_server.sh`도 Hydra 기본값을
-상속하므로 그대로 실행하면 된다. 검증된 기본 설정은 workers 4, prefetch 1,
+상속하므로 그대로 실행하면 된다. 기본 설정은 학습 workers 4, 평가 workers 0, prefetch 1,
 센서 mmap ON, batch 파일 묶기 ON, worker별 decoder 2개이며 Frozen ViT Cache는 OFF다.
 기본 캐시 경로는 `outputs/sensor_mmap`이고, 경로를 변경할 때만 다음 override를 사용한다.
 

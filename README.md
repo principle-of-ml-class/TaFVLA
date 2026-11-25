@@ -185,6 +185,28 @@ ffprobe extraction every time.
 
 ### Training throughput controls
 
+학습 worker는 `training.num_workers`(기본 4), Validation·Alignment Retrieval worker는
+`training.eval_num_workers`(기본 0)로 따로 설정합니다. 평가 worker가 0이면 메인
+프로세스에서 평가 데이터를 준비하며, `persistent_workers=False`이고 `prefetch_factor`는
+전달하지 않습니다. `training.eval_num_workers=2`로 변경하면 평가 worker 2개와
+기존 `training.prefetch_factor`를 사용합니다. 평가 sample order와 gallery 설정은 유지합니다.
+
+`pickle data was truncated`와 leaked semaphore 경고만으로 RAM/OOM, IPC 또는 worker 생성
+중 어느 것이 원인인지 확정할 수 없습니다. 재발하면 오류 직전 부모·worker의 PID,
+전체 traceback·종료 코드, RSS/PSS를 함께 기록하세요. 조회 권한이 있으면 아래도 확인합니다.
+
+```bash
+journalctl -k --since "1 hour ago" | rg -i 'oom|out of memory|killed process|memory cgroup'
+df -h /dev/shm
+df -i /dev/shm
+ulimit -n
+```
+
+또한 부모 PID의 `/proc/PID/cgroup`이 가리키는 cgroup v2 경로에서 `memory.events`의
+`oom`/`oom_kill` 증가와 `memory.current`/`memory.max`를 확인합니다. SIGKILL/종료 코드
+137만으로 OOM을 단정하지 말고 커널·cgroup 로그와 대조하세요. semaphore 경고는 비정상
+종료 후 정리가 덜 된 결과일 수도 있으므로 단독 원인 증거로 사용하지 않습니다.
+
 Sensor Parquet values use a process-local LRU cache bounded by
 `data.sensor_cache_max_mb` per DataLoader worker. `TaFDataset.sensor_cache_stats()`
 reports reads, hits, misses, hit rate, and resident bytes for the calling

@@ -67,6 +67,14 @@ from utils.live_progress import emit as progress_event
 register_config_schema()
 
 
+def _loader_worker_kwargs(workers: int, prefetch_factor: int) -> dict[str, Any]:
+    """Keep single-process evaluation free of multiprocessing-only options."""
+    kwargs = {"num_workers": workers, "persistent_workers": workers > 0}
+    if workers:
+        kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
+
+
 @torch.no_grad()
 def validate(
     model: torch.nn.Module,
@@ -365,14 +373,14 @@ def run_training(cfg: DictConfig) -> None:
     )
     progress_event("Training Sampler Initialization", "Completed", current=len(train_indices), total=len(train_indices))
     workers = int(train_cfg.num_workers)
-    prefetch = {"prefetch_factor": int(train_cfg.prefetch_factor)} if workers else {}
+    eval_workers = int(train_cfg.eval_num_workers)
+    train_worker_kwargs = _loader_worker_kwargs(workers, int(train_cfg.prefetch_factor))
+    eval_worker_kwargs = _loader_worker_kwargs(eval_workers, int(train_cfg.prefetch_factor))
     train_loader = DataLoader(
         Subset(cached_dataset, train_indices),
         batch_sampler=batch_sampler,
-        num_workers=workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=workers > 0,
-        **prefetch,
+        **train_worker_kwargs,
         **collate,
     )
     validation_gap = max(
@@ -393,11 +401,9 @@ def run_training(cfg: DictConfig) -> None:
     val_loader = DataLoader(
         Subset(cached_dataset, val_indices),
         batch_sampler=validation_sampler,
-        num_workers=workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=workers > 0,
         generator=validation_generator,
-        **prefetch,
+        **eval_worker_kwargs,
         **collate,
     )
 
@@ -467,11 +473,9 @@ def run_training(cfg: DictConfig) -> None:
             Subset(dataset, selection.indices),
             batch_size=min(int(train_cfg.batch_size), len(selection.indices)),
             shuffle=False,
-            num_workers=workers,
             pin_memory=device.type == "cuda",
-            persistent_workers=workers > 0,
             generator=alignment_generator,
-            **prefetch,
+            **eval_worker_kwargs,
         )
         print(
             f"Fixed alignment retrieval set: {len(selection.indices)} validation pairs, "

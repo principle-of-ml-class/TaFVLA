@@ -79,6 +79,7 @@ training:
   weight_decay: 0.00001
   max_steps: 25000
   num_workers: 4
+  eval_num_workers: 0            # Validation and alignment; avoid extra worker pools by default.
   prefetch_factor: 1             # Bound queued image batches for large N and limited host RAM.
   seed: 42
   amp: true

@@ -25,6 +25,7 @@ for N in 1 3 5 7 10 20; do
       training.gradient_accumulation_steps=1 \
       training.min_same_episode_window_gap=20 \
       training.num_workers=4 \
+      training.eval_num_workers=0 \
       training.prefetch_factor=1 \
       training.output_dir=outputs/comparison/runs \
       training.save_every=5000 \

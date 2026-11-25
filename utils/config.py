@@ -90,6 +90,7 @@ class TrainingConfig:
     weight_decay: float = 1.0e-5
     max_steps: int = 10000
     num_workers: int = 4
+    eval_num_workers: int = 0
     prefetch_factor: int = 1
     seed: int = 42
     amp: bool = True
