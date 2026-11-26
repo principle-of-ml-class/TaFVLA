@@ -1,0 +1,3 @@
+# Optional UI only. Install with uv pip; training does not import these packages.
+streamlit>=1.40,<2
+plotly>=6,<7

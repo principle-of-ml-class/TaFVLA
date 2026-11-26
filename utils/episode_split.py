@@ -15,6 +15,71 @@ import pyarrow.parquet as pq
 from utils.dynamics import DYNAMICS, split_group_key
 
 
+def assign_raw_episodes(episodes: list[dict], *, previous: list[dict] = (), seed: int = 42,
+                        validation_fraction: float = .16778, test_fraction: float = .1) -> dict:
+    """Assign before phase classification; lengths are raw-frame counts, never label counts.
+
+    Existing assignments are immutable. New episodes in held-out sequences remain Test.
+    New non-Test sequences use the same within-sequence floor/ceil episode-count policy.
+    """
+    if not 0 < validation_fraction < 1 or not 0 < test_fraction < 1:
+        raise ValueError("Invalid raw episode split fractions")
+    def key(row):
+        return (row["sensor_configuration"], row["sequence_id"], int(row["episode_index"]))
+    known = {}
+    for row in previous:
+        k = key(row)
+        if row["split"] not in {"train", "validation", "test"} or (k in known and known[k] != row["split"]):
+            raise ValueError(f"Conflicting previous episode assignments: {k}")
+        known[k] = row["split"]
+    heldout = {k[:2] for k, s in known.items() if s == "test"}
+    if any(k[:2] in heldout and s != "test" for k, s in known.items()):
+        raise ValueError("Reference Test sequence crosses splits")
+    groups = defaultdict(list)
+    if len({key(r) for r in episodes}) != len(episodes):
+        raise ValueError("Duplicate raw episode identity")
+    for row in episodes:
+        groups[key(row)[:2]].append(row)
+    if not known:
+        sequences = sorted(groups); random.Random(seed).shuffle(sequences)
+        if len(sequences) < 2:
+            raise ValueError("Need at least two sequences for held-out Test")
+        heldout = set(sequences[:max(1, min(len(sequences)-1, round(len(sequences)*test_fraction)))])
+    result = {}
+    rng = random.Random(seed)
+    for seq, rows in sorted(groups.items()):
+        rows = sorted(rows, key=key)
+        if seq in heldout:
+            result.update({key(r): "test" for r in rows}); continue
+        if len(rows) == 1:
+            if known.get(key(rows[0])) == "validation":
+                raise ValueError("Singleton reference sequence was Validation; cannot preserve both policies")
+            result[key(rows[0])] = "train"; continue
+        result.update({key(r): known[key(r)] for r in rows if key(r) in known})
+        missing = [r for r in rows if key(r) not in result]
+        if not missing:
+            continue
+        n = len(rows); target = sum(r["length"] for r in rows)*validation_fraction
+        sizes = {max(1, min(n-1, math.floor(n*validation_fraction))), max(1, min(n-1, math.ceil(n*validation_fraction)))}
+        fixed_val = [r for r in rows if result.get(key(r)) == "validation"]
+        candidates = []
+        for size in sizes:
+            remaining = size-len(fixed_val)
+            if 0 <= remaining <= len(missing):
+                if math.comb(len(missing), remaining) > 1_000_000:
+                    raise ValueError("Raw split candidate set too large")
+                candidates.extend(itertools.combinations(missing, remaining))
+        if not candidates:
+            raise ValueError(f"Existing assignments leave no valid Train/Validation split: {seq}")
+        rng.shuffle(candidates)
+        chosen = min(candidates, key=lambda subset: abs(sum(r["length"] for r in (*fixed_val, *subset))-target))
+        validation = {key(r) for r in chosen}
+        result.update({key(r): "validation" if key(r) in validation else "train" for r in missing})
+    if set(result.values()) != {"train", "validation", "test"}:
+        raise ValueError("Raw episode split requires nonempty Train/Validation/Test")
+    return result
+
+
 def episode_manifest_identity(parent_id: str, seed: int, assignments: dict) -> str:
     payload = {"protocol": "episode-repartition-v1", "parent_manifest_id": parent_id,
                "split_unit": "episode", "split_seed": seed,

@@ -1,0 +1,62 @@
+{
+  "sources": [
+    {
+      "path": "script/stage4_short_windows.py",
+      "blob_sha": "64a2fa7b32902f7a13ea57a5bfcaeaa131564b81",
+      "url": "https://github.com/joseph316/03_TaFVLA/blob/master/script/stage4_short_windows.py"
+    },
+    {
+      "path": "script/stage6_fusion.py",
+      "blob_sha": "e80a5261a8b344bc03261abcc52b0de275a4b23e",
+      "url": "https://github.com/joseph316/03_TaFVLA/blob/master/script/stage6_fusion.py"
+    },
+    {
+      "path": "script/stage7_routing.py",
+      "blob_sha": "5da391a2d5b36e4775d849bdb55754af0b0bf926",
+      "url": "https://github.com/joseph316/03_TaFVLA/blob/master/script/stage7_routing.py"
+    },
+    {
+      "path": "reproduction/README.md",
+      "blob_sha": "67ea9f3a57adfefe66580bef4a346ea05a53edc6",
+      "url": "https://github.com/joseph316/03_TaFVLA/blob/master/reproduction/README.md"
+    },
+    {
+      "path": "src/taf_contact_explorer/analysis/preprocessing.py",
+      "blob_sha": "dcd674bdaa94e70b1c2615aa33e410d0ade595bf",
+      "url": "https://github.com/principle-of-ml-class/dataset_visualization/blob/main/src/taf_contact_explorer/analysis/preprocessing.py"
+    },
+    {
+      "path": "configs/classifier.yaml",
+      "blob_sha": "d90e959ec167c8cb94bfdf74443b72c8d6a71a6b",
+      "url": "https://github.com/principle-of-ml-class/dataset_visualization/blob/main/configs/classifier.yaml"
+    },
+    {
+      "path": "src/taf_contact_explorer/pages/episode_explorer.py",
+      "blob_sha": "118027ecad7bac958b09fdba9c18476a152296e7",
+      "url": "https://github.com/principle-of-ml-class/dataset_visualization/blob/main/src/taf_contact_explorer/pages/episode_explorer.py"
+    },
+    {
+      "path": "src/taf_contact_explorer/pages/model_analysis.py",
+      "blob_sha": "dbecf623d011ba2307d9bd03dd0c209dbd69a51a",
+      "url": "https://github.com/principle-of-ml-class/dataset_visualization/blob/main/src/taf_contact_explorer/pages/model_analysis.py"
+    },
+    {
+      "path": "src/taf_contact_explorer/visualization/episode.py",
+      "blob_sha": "12b3a5f53ee83b517534ed4780aaab99e070a0ab",
+      "url": "https://github.com/principle-of-ml-class/dataset_visualization/blob/main/src/taf_contact_explorer/visualization/episode.py"
+    },
+    {
+      "path": "src/taf_contact_explorer/visualization/contact.py",
+      "blob_sha": "c7c909e2778230ec4ac8762761e4667c9003be03",
+      "url": "https://github.com/principle-of-ml-class/dataset_visualization/blob/main/src/taf_contact_explorer/visualization/contact.py"
+    }
+  ],
+  "adaptations": [
+    "stage4 classify and train raw second-difference noise/IQR: same formulas, .2/.3 windows only, snake_case phases; strict finite/timestamp validation and explicit short-episode diagnostics added",
+    "stage6 fuse: exhaustive same symmetric truth table; no post-fusion smoothing",
+    "preprocessing: _select_sign correlation rule and low-pressure .10 quantile median baseline only; no Savitzky-Golay or contact exclusion",
+    "stage7: retain 5-percent validation rule and oracle interpretation, compute N from local seed42 validation instead of upstream hardcoded policy or multi-seed results",
+    "visualization: adapt heatmap/two-row wrench timeline ideas; local prepared labels and episode readers replace external data/config dependencies; phase colors follow requested orange/green/purple/gray"
+  ],
+  "external_runtime_dependencies": false
+}

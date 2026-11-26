@@ -47,7 +47,7 @@ METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     "alignment/f2t/recall_at_1": {"goal": "max"},
     "alignment/f2t/recall_at_5": {"goal": "max"},
 }
-for _group in ("all", "loading", "unloading", "holding", "transition", "sudden_event"):
+for _group in ("all", "loading", "unloading", "holding", "transition", "sudden_event", "unknown"):
     for _metric in ("recall_at_1", "recall_at_5", "mrr"):
         METRIC_DEFINITIONS[f"alignment/dynamics/{_group}/{_metric}"] = {"goal": "max"}
 for _name in (
@@ -139,9 +139,11 @@ def build_start_message(info: Mapping[str, Any]) -> str:
         f"AMP: {info['amp']} | Device: {info['device']} | GPU: {info.get('gpu') or 'N/A'}",
         f"Backbone: {info['backbone']} | frozen: {info['freeze_backbone']}",
         *([f"Backbone identity / input protocol: {info['backbone_metadata']}"] if info.get("backbone_metadata") else []),
-        f"Mode: {'interaction dynamics comparison (loading, unloading, holding, transition, sudden_event)' if info.get('comparison') else 'standard'} | "
+        f"Mode: {('four-phase comparison (loading, holding, unloading, unknown)' if 'unknown' in info.get('phase_names', []) else 'interaction dynamics comparison (loading, unloading, holding, transition, sudden_event)') if info.get('comparison') else 'standard'} | "
         f"seed: {info.get('seed', 'N/A')} | workers: {info.get('workers', 'N/A')} | "
         f"prefetch: {info.get('prefetch_factor', 'N/A')}",
+        *([f"InfoNCE forward batch: {info['batch_size']}; gradient accumulation does not increase its negatives"]
+          if "unknown" in info.get("phase_names", []) else []),
         f"Frozen ViT feature cache: {'enabled' if info.get('feature_cache') else 'disabled'}",
         f"Output: {info['output_dir']} | Resume: {info.get('resume') or 'none'}",
         *([f"W&B: {info['wandb_url']}"] if info.get("wandb_url") else []),

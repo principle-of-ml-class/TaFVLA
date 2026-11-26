@@ -19,6 +19,15 @@ from dataset.taf_dataset import TaFDataset
 
 WINDOWS = (1, 3, 5, 7, 10, 20)
 DYNAMICS = ("loading", "unloading", "holding", "transition", "sudden_event")
+
+
+def phase_groups(rows):
+    from utils.phase_classifier import PHASES
+    return PHASES if rows and rows[0].get("schema_version") == "phase4-manifest-v1" else DYNAMICS
+
+
+def row_phase(row):
+    return row["phase"] if row.get("schema_version") == "phase4-manifest-v1" else row["dynamics5"]
 REQUIRED_LABEL = {"sensor_configuration", "sequence_id", "episode_index", "frame_index",
                   "timestamp_anchor", "contact_phase", "sudden_event", "schema_version",
                   "configuration_hash", "classifier_variant"}
@@ -239,6 +248,25 @@ class ManifestDataset(Dataset):
         if len({r["sample_id"] for r in self.rows}) != len(self.rows):
             raise ValueError("Manifest contains duplicate sample IDs")
         self.manifest_id = self.rows[0]["manifest_id"]
+        schemas = {r.get("schema_version", "legacy") for r in self.rows}
+        if len(schemas) != 1:
+            raise ValueError("Manifest contains mixed schemas")
+        self.phase4 = next(iter(schemas)) == "phase4-manifest-v1"
+        if self.phase4:
+            from utils.phase_classifier import identity
+            payload = json.loads(Path(manifest_path).with_name("manifest_identity.json").read_text())
+            if identity(payload) != self.manifest_id:
+                raise ValueError("Phase4 manifest provenance identity mismatch")
+            assignments = json.loads(Path(manifest_path).with_name("episode_split.json").read_text())
+            if identity(assignments["episodes"]) != payload["split_id"]:
+                raise ValueError("Phase4 episode split identity mismatch")
+            self._phase4_assignments = {(r["sensor_configuration"], r["sequence_id"], r["episode_index"]): r["split"]
+                                        for r in assignments["episodes"]}
+            for key, value in {"dataset_id": payload["dataset_id"], "split_id": payload["split_id"],
+                               "calibration_id": payload["calibration_id"],
+                               "classifier_configuration_hash": payload["classifier_id"]}.items():
+                if any(r[key] != value for r in self.rows):
+                    raise ValueError(f"Mixed phase4 provenance: {key}")
         units = {r.get("split_unit", "sequence") for r in self.rows}
         if len(units) != 1 or not units <= {"sequence", "episode"}:
             raise ValueError("Manifest has mixed or invalid split units")
@@ -254,6 +282,7 @@ class ManifestDataset(Dataset):
         prior_position = (-1, -1)
         sequence_splits = {}
         episode_splits = {}
+        allowed_phases = phase_groups(self.rows)
         from utils.live_progress import emit as progress_event
         for row_index, row in enumerate(self.rows, 1):
             if row["split"] not in {"train", "validation", "test"}:
@@ -264,7 +293,9 @@ class ManifestDataset(Dataset):
             previous_split = sequence_splits.setdefault(row["sequence_id"], row["split"])
             if self.split_unit == "sequence" and previous_split != row["split"]:
                 raise ValueError(f"Sequence crosses splits: {row['sequence_id']}")
-            if row["dynamics5"] != dynamics5(row["contact_phase"], row["sudden_event"]):
+            if self.phase4 and (row["phase"] not in allowed_phases or self._phase4_assignments.get(ep_key) != row["split"]):
+                raise ValueError(f"Invalid Phase4 label/split: {row['sample_id']}")
+            if not self.phase4 and row["dynamics5"] != dynamics5(row["contact_phase"], row["sudden_event"]):
                 raise ValueError(f"Manifest dynamics differs from source labels: {row['sample_id']}")
             if row["sample_id"] != sample_id(row["sensor_configuration"], row["sequence_id"],
                                               row["episode_index"], row["anchor_frame_position"]):
@@ -318,7 +349,8 @@ class ManifestDataset(Dataset):
             force, pressure = torch.from_numpy(force), torch.from_numpy(pressure)
         return {"tactile": tactile,
                 "force": force, "pressure": pressure,
-                "metadata": {"sample_id": row["sample_id"], "dynamics5": row["dynamics5"],
+                "metadata": {"sample_id": row["sample_id"], "phase": row_phase(row),
+                             **({"dynamics5": row["dynamics5"]} if not getattr(self, "phase4", False) else {}),
                              "sensor_type": ep.sensor_type, "sequence_id": ep.sequence_id,
                              "episode_index": ep.episode_index, "frame_indices": torch.from_numpy(ep.frames[offsets].copy()),
                              "timestamps": torch.from_numpy(ep.timestamps[offsets].copy()),

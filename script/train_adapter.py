@@ -18,7 +18,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Subset
 
 from dataset.taf_dataset import TaFDataset
-from utils.dynamics import ManifestDataset, split_group_key
+from utils.dynamics import ManifestDataset, split_group_key, phase_groups
 from utils.comparison_eval import write_rows
 from utils.alignment import (
     AlignmentSelection,
@@ -620,6 +620,7 @@ def run_training(cfg: DictConfig) -> None:
         "backbone": str(cfg.tactile_encoder.backbone),
         "freeze_backbone": bool(cfg.tactile_encoder.freeze_backbone),
         "comparison": comparison,
+        "phase_names": list(phase_groups(dataset.rows)) if comparison else [],
         "seed": seed,
         "workers": workers,
         "prefetch_factor": int(train_cfg.prefetch_factor) if workers else None,

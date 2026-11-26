@@ -156,6 +156,10 @@ def aggregate(paths, output):
 
 
 def main():
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].startswith("phase4-"):
+        from script.phase4 import main as phase4_main
+        return phase4_main([sys.argv[1].removeprefix("phase4-"), *sys.argv[2:]])
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     manifest = sub.add_parser("manifest")

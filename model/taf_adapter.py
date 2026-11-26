@@ -111,6 +111,52 @@ class TaFAdapter(nn.Module):
             raise ValueError(f"Expected T={self.window_size}, got T={tactile.shape[1]}")
         return self.tactile_encoder(tactile)
 
+    @torch.no_grad()
+    def observed_code_pairs(self, pressure: torch.Tensor, force: torch.Tensor) -> torch.Tensor:
+        """Sensor-only bank construction. Call exclusively on the Train split."""
+        p, f = self._normalize(pressure, force)
+        encoded = self.force_encoder(p, f)
+        return torch.stack((encoded["pressure_indices"], encoded["force_indices"]), dim=1)
+
+    @torch.no_grad()
+    def decode_tactile(self, tactile: torch.Tensor, code_pairs: torch.Tensor, *, chunk_size: int = 1024):
+        """Tactile-only prediction; no force/pressure argument or ground-truth gallery."""
+        return self.decode_tactile_embedding(self.encode_tactile(tactile), code_pairs, chunk_size=chunk_size)
+
+    @torch.no_grad()
+    def decode_tactile_embedding(self, embedding: torch.Tensor, code_pairs: torch.Tensor, *, chunk_size: int = 1024):
+        """Full concatenated cosine lookup, then decode the ORIGINAL code vectors.
+
+        Lexicographically sorted pairs and first-maximum selection resolve ties
+        deterministically, including ties spanning search chunks.
+        """
+        if code_pairs.ndim != 2 or code_pairs.shape[1] != 2 or not len(code_pairs) or chunk_size < 1:
+            raise ValueError("Nonempty code-pair bank [K,2] and positive chunk_size required")
+        if code_pairs.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Code pairs must contain integer indices")
+        pairs = torch.unique(code_pairs.to(embedding.device, dtype=torch.long), dim=0, sorted=True)
+        pbook = self.force_encoder.pressure.quantizer.codebook
+        fbook = self.force_encoder.force.quantizer.codebook
+        if (pairs < 0).any() or (pairs[:, 0] >= pbook.num_embeddings).any() or (pairs[:, 1] >= fbook.num_embeddings).any():
+            raise ValueError("Code-pair index outside checkpoint codebooks")
+        z = F.normalize(embedding.float(), dim=-1)
+        if z.ndim != 2 or z.shape[1] != self.force_encoder.output_dim or not torch.isfinite(z).all():
+            raise ValueError("Invalid tactile embedding")
+        best = torch.full((len(z),), -float("inf"), device=z.device)
+        chosen = torch.zeros(len(z), dtype=torch.long, device=z.device)
+        for start in range(0, len(pairs), chunk_size):
+            part = pairs[start:start+chunk_size]
+            vectors = torch.cat((pbook(part[:, 0]), fbook(part[:, 1])), dim=-1)
+            scores, index = (z @ F.normalize(vectors.float(), dim=-1).T).max(dim=1)
+            better = scores > best
+            chosen[better] = start+index[better]; best[better] = scores[better]
+        selected = pairs[chosen]
+        pressure = self.force_encoder.pressure.decoder(pbook(selected[:, 0])).view(-1, self.window_size, 12, 12)
+        force = self.force_encoder.force.decoder(fbook(selected[:, 1])).view(-1, self.window_size, 6)
+        return {"pressure": pressure*self.pressure_std+self.pressure_mean,
+                "force": force*self.force_std+self.force_mean, "code_pairs": selected,
+                "similarity": best, "method": "train-observed code-pair decoding"}
+
     def _finish_forward(
         self,
         z_tactile: torch.Tensor,

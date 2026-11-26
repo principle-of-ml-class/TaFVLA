@@ -7,6 +7,17 @@ training.
 
 ## Sparsh DINO Small
 
+네 상황 분류와 데이터 준비·Streamlit·Ridge/VQ 평가·oracle routing·여섯 N 순차 실행은
+[Phase4 파이프라인 문서](docs/phase4_pipeline.md)를 참고하세요.
+새 schema/경로를 사용하며 기존 K-means·scheduler 실험 설정과 checkpoint는 보존합니다.
+
+```bash
+bash scripts/phase4.sh prepare
+bash scripts/phase4.sh ui
+bash scripts/phase4.sh run --n 5
+# 여섯 N은 사용자가 시작: bash scripts/phase4.sh run
+```
+
 공식 6채널 Sparsh DINO Small을 사용하는 설정과 검증·전처리 차이·실행 명령은
 [Sparsh 통합 문서](docs/sparsh_integration.md)를 참고하세요. 기존 ImageNet 설정도 유지합니다.
 

@@ -176,7 +176,8 @@ class TrainingProgress:
             f"Cross-Modal Retrieval | {alignment_title}" + (
                 " | " + " ".join(
                     f"{name}:{self._value(alignment, f'alignment/dynamics/{name}/recall_at_1').strip()}"
-                    for name in ("loading", "unloading", "holding", "transition", "sudden_event")
+                    for name in (("loading", "holding", "unloading", "unknown") if "alignment/dynamics/unknown/queries" in alignment
+                                 else ("loading", "unloading", "holding", "transition", "sudden_event"))
                 ) if "alignment/dynamics/all/queries" in alignment else ""
             ),
             (
@@ -273,7 +274,8 @@ class TrainingProgress:
             f"hard_gap={self._value(metrics, 'alignment/t2f/hard_negative_margin').strip()}"
             + (" | dynamics R@1 " + " ".join(
                 f"{name}={self._value(metrics, f'alignment/dynamics/{name}/recall_at_1').strip()}"
-                for name in ("loading", "unloading", "holding", "transition", "sudden_event")
+                for name in (("loading", "holding", "unloading", "unknown") if "alignment/dynamics/unknown/queries" in metrics
+                             else ("loading", "unloading", "holding", "transition", "sudden_event"))
             ) if "alignment/dynamics/all/queries" in metrics else "")
         )
 

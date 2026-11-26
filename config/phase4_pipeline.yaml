@@ -1,0 +1,25 @@
+# Standalone pipeline schema. No K-means/scheduler options are changed here.
+data_root: /ssdg/spl_yeongyoo/taf_dataset
+sensors: [custom_6x6_markers]
+timestamp_cache_dir: null
+sensor_mmap_dir: outputs/sensor_mmap
+split_reference: auto
+split_seed: 42
+validation_fraction: 0.16778096628471026
+test_fraction: 0.1
+prepared_dir: metadata/phase4/v1
+results_dir: outputs/phase4/v1
+training_config: taf_adapter_sparsh_episode
+windows: [1, 3, 5, 7, 10, 20]
+seed: 42
+eval_batch_size: 16
+gallery_size: 256
+gallery_gap: 20
+gallery_seed: 42
+ridge_alphas: [0.01, 0.1, 1.0, 10.0, 100.0]
+classifier:
+  range_fraction: 0.02
+  noise_multiplier: 3.0
+  min_run_frames: 2
+  baseline_pressure_quantile: 0.1
+  timestamp_relative_tolerance: 0.1

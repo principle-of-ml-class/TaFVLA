@@ -259,6 +259,54 @@ class StabilityTests(unittest.TestCase):
         from utils.logging import TrainingProgress
         self.assertEqual(TrainingProgress._value({"train/learning_rate": 1e-6}, "train/learning_rate"), "1.00e-06")
 
+    def test_resume_preserves_actual_adamw_updates(self):
+        torch.manual_seed(42)
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=.001)
+        scheduler = UpdateLRScheduler(optimizer, OPTIONS | {"warmup_steps": 2}, 7, 1e-4)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        def update(module, opt, schedule, scale):
+            opt.zero_grad(set_to_none=True)
+            module(torch.tensor([[1., 2.], [3., 4.]])).square().mean().backward()
+            lr = opt.param_groups[0]["lr"]
+            self.assertTrue(optimizer_update(opt, scale, schedule))
+            return lr
+        for _ in range(3):
+            update(model, optimizer, scheduler, scaler)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"resume.pt"
+            save_checkpoint(path, model=model, optimizer=optimizer, scaler=scaler,
+                            step=3, epoch=0, config={}, normalization={}, train_keys=[], val_keys=[],
+                            scheduler_state=scheduler.state_dict())
+            saved = load_checkpoint(path)
+        resumed = torch.nn.Linear(2, 1); resumed.load_state_dict(saved["model"])
+        resumed_opt = torch.optim.AdamW(resumed.parameters(), lr=1e-4, weight_decay=.001)
+        resumed_opt.load_state_dict(saved["optimizer"])
+        resumed_scheduler = UpdateLRScheduler(resumed_opt, OPTIONS | {"warmup_steps": 2}, 7, 1e-4)
+        resumed_scheduler.restore(saved["scheduler"], saved["step"])
+        resumed_scaler = torch.amp.GradScaler("cpu", enabled=False)
+        resumed_scaler.load_state_dict(saved["scaler"])
+        for _ in range(4):
+            self.assertEqual(update(model, optimizer, scheduler, scaler),
+                             update(resumed, resumed_opt, resumed_scheduler, resumed_scaler))
+            for key, value in model.state_dict().items():
+                torch.testing.assert_close(value, resumed.state_dict()[key], rtol=0, atol=0)
+
+    def test_start_notification_contains_stability_settings(self):
+        from tests.test_trainctl import start_info
+        from utils.trainctl import build_start_message
+        register_config_schema()
+        with initialize_config_dir(config_dir=str(ROOT/"config"), version_base="1.3"):
+            cfg = compose(config_name="taf_adapter_sparsh_episode_stable")
+        info = start_info(cfg) | {"codebook_initialization": cfg.vq.initialization,
+                                  "scheduler_type": cfg.training.scheduler.type,
+                                  "warmup_steps": cfg.training.scheduler.warmup_steps,
+                                  "minimum_lr": cfg.training.scheduler.min_lr}
+        message = build_start_message(info)
+        for expected in ("initialization: kmeans", "Scheduler: cosine", "warmup steps: 500",
+                         "peak LR: 0.0001", "minimum LR: 1e-05"):
+            self.assertIn(expected, message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,8 @@ dropout 0.2, frozen Sparsh DINO Small, 512×128 codebook 두 개, loss와 manife
 gallery 및 `epoch_shuffled` sampler/seed는 기존 값입니다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python -m script.train_adapter \
+CUDA_VISIBLE_DEVICES="$(nvidia-smi -i 0 --query-gpu=uuid --format=csv,noheader)" \
+uv run python -m script.train_adapter \
   --config-name=taf_adapter_sparsh_episode_stable
 
 # 물리 GPU 0의 UUID를 사용하고 Rich dashboard와 trainctl을 함께 실행
@@ -35,12 +36,14 @@ codebook 크기보다 적으면 명시적으로 실패합니다. Train-only norm
 
 ```bash
 # Uniform 초기화 + warmup/cosine
-CUDA_VISIBLE_DEVICES=0 uv run python -m script.train_adapter \
+CUDA_VISIBLE_DEVICES="$(nvidia-smi -i 0 --query-gpu=uuid --format=csv,noheader)" \
+uv run python -m script.train_adapter \
   --config-name=taf_adapter_sparsh_episode_stable vq.initialization=uniform \
   training.output_dir=outputs/comparison/sparsh_episode_uniform_cosine_runs
 
 # K-means + constant LR
-CUDA_VISIBLE_DEVICES=0 uv run python -m script.train_adapter \
+CUDA_VISIBLE_DEVICES="$(nvidia-smi -i 0 --query-gpu=uuid --format=csv,noheader)" \
+uv run python -m script.train_adapter \
   --config-name=taf_adapter_sparsh_episode_stable training.scheduler.type=constant \
   training.output_dir=outputs/comparison/sparsh_episode_kmeans_constant_runs
 ```
@@ -53,7 +56,8 @@ AMP overflow로 update가 생략되면 global step과 scheduler step 모두 그�
 skip count만 증가합니다. Microbatch 수와 epoch 경계는 스케줄러를 진행시키지 않습니다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python -m script.train_adapter \
+CUDA_VISIBLE_DEVICES="$(nvidia-smi -i 0 --query-gpu=uuid --format=csv,noheader)" \
+uv run python -m script.train_adapter \
   --config-name=taf_adapter_sparsh_episode_stable \
   training.resume=outputs/comparison/sparsh_episode_stable_runs/<실제_run_폴더>/step_00001000.pt
 ```

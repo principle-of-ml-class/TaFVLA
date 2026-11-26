@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from utils.dynamics import DYNAMICS, ManifestDataset
+from utils.dynamics import DYNAMICS, ManifestDataset, phase_groups, row_phase
 
 
 def gallery_selection(rows: list[dict], split: str, *, seed: int, max_pairs: int,
@@ -26,13 +26,13 @@ def gallery_selection(rows: list[dict], split: str, *, seed: int, max_pairs: int
         if row["split"] == split:
             grouped[(row["sensor_configuration"], row["sequence_id"], row["episode_index"])].append(row)
     rng = random.Random(seed)
-    frequency = Counter(r["dynamics5"] for r in rows if r["split"] == split)
+    frequency = Counter(row_phase(r) for r in rows if r["split"] == split)
     queues = []
     for key in sorted(grouped):
         ordered = sorted(grouped[key], key=lambda x: x["anchor_frame_position"])
         shuffled = list(ordered)
         rng.shuffle(shuffled)
-        rare_first = sorted(shuffled, key=lambda r: frequency[r["dynamics5"]])
+        rare_first = sorted(shuffled, key=lambda r: frequency[row_phase(r)])
         options = []
         for candidates in (ordered, rare_first):
             selected = []
@@ -40,8 +40,8 @@ def gallery_selection(rows: list[dict], split: str, *, seed: int, max_pairs: int
                 if all(abs(row["anchor_frame_position"]-prior["anchor_frame_position"]) >= min_gap for prior in selected):
                     selected.append(row)
             options.append(selected)
-        spaced = max(options, key=lambda picked: (len(picked), len({r["dynamics5"] for r in picked}),
-                                                  sum(r["dynamics5"] == "sudden_event" for r in picked)))
+        spaced = max(options, key=lambda picked: (len(picked), len({row_phase(r) for r in picked}),
+                                                  sum(row_phase(r) == "sudden_event" for r in picked) if "sudden_event" in phase_groups(rows) else 0))
         rng.shuffle(spaced)
         queues.append(spaced)
     rng.shuffle(queues)
@@ -88,10 +88,10 @@ def save_gallery_plan(rows: list[dict], path: Path, *, seed: int, max_pairs: int
     for split in ("validation", "test"):
         selected = [lookup[s] for s in plan[split]]
         plan["support"][split] = {group: {
-            "queries": sum(r["dynamics5"] == group for r in selected),
-            "episodes": len({(r["sequence_id"], r["episode_index"]) for r in selected if r["dynamics5"] == group}),
-            "sequences": len({r["sequence_id"] for r in selected if r["dynamics5"] == group}),
-        } for group in DYNAMICS}
+            "queries": sum(row_phase(r) == group for r in selected),
+            "episodes": len({(r["sensor_configuration"], r["sequence_id"], r["episode_index"]) for r in selected if row_phase(r) == group}),
+            "sequences": len({(r["sensor_configuration"], r["sequence_id"]) for r in selected if row_phase(r) == group}),
+        } for group in phase_groups(rows)}
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and json.loads(path.read_text()) != plan:
         raise ValueError(f"Existing gallery plan differs: {path}")
@@ -110,16 +110,16 @@ def retrieval_by_dynamics(similarity: torch.Tensor, rows: list[dict]) -> tuple[l
     query = []
     for i, row in enumerate(rows):
         rank = int(ranks[i])
-        query.append({"sample_id": row["sample_id"], "contact_state": row["dynamics5"],
+        query.append({"sample_id": row["sample_id"], "contact_state": row_phase(row),
                       "rank": rank, "recall_at_1": int(rank <= 1), "recall_at_5": int(rank <= 5),
                       "mrr": 1/rank, "positive_tie_count": int(ties[i]),
                       "sensor_configuration": row["sensor_configuration"],
                       "sequence_id": row["sequence_id"], "episode_index": row["episode_index"]})
     support = {}
-    for group in ("all", *DYNAMICS):
+    for group in ("all", *phase_groups(rows)):
         part = query if group == "all" else [r for r in query if r["contact_state"] == group]
-        support[group] = {"queries": len(part), "episodes": len({(r["sequence_id"], r["episode_index"]) for r in part}),
-                          "sequences": len({r["sequence_id"] for r in part}), "gallery_size": count,
+        support[group] = {"queries": len(part), "episodes": len({(r["sensor_configuration"], r["sequence_id"], r["episode_index"]) for r in part}),
+                          "sequences": len({(r["sensor_configuration"], r["sequence_id"]) for r in part}), "gallery_size": count,
                           "recall_at_1": float(np.mean([r["recall_at_1"] for r in part])) if part else None,
                           "recall_at_5": float(np.mean([r["recall_at_5"] for r in part])) if part else None,
                           "mrr": float(np.mean([r["mrr"] for r in part])) if part else None}
@@ -192,6 +192,8 @@ def _embeddings(model, dataset, indices, device, batch_size):
 
 def evaluate_probe(model, dataset: ManifestDataset, *, device, batch_size: int,
                    alphas: tuple[float, ...] = (.01, .1, 1., 10., 100.)) -> tuple[list[dict], dict]:
+    if getattr(dataset, "phase4", False):
+        raise ValueError("Phase4 uses the common endpoint wrench+pressure protocol; use phase4-evaluate, not the legacy whole-window probe")
     for p in model.tactile_encoder.parameters():
         p.requires_grad_(False)
     model.eval()
