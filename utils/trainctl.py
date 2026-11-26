@@ -135,6 +135,7 @@ def build_start_message(info: Mapping[str, Any]) -> str:
         f"validation {info['val_windows']} windows/{info['val_groups']} groups",
         f"AMP: {info['amp']} | Device: {info['device']} | GPU: {info.get('gpu') or 'N/A'}",
         f"Backbone: {info['backbone']} | frozen: {info['freeze_backbone']}",
+        *([f"Backbone identity / input protocol: {info['backbone_metadata']}"] if info.get("backbone_metadata") else []),
         f"Mode: {'interaction dynamics comparison (loading, unloading, holding, transition, sudden_event)' if info.get('comparison') else 'standard'} | "
         f"seed: {info.get('seed', 'N/A')} | workers: {info.get('workers', 'N/A')} | "
         f"prefetch: {info.get('prefetch_factor', 'N/A')}",

@@ -1,0 +1,21 @@
+defaults:
+  - taf_adapter_sparsh
+  - _self_
+
+data:
+  window_size: 5
+  split_unit: episode
+  split_seed: 42
+
+comparison:
+  enabled: true
+  manifest: metadata/episode_split/manifest.parquet
+
+training:
+  max_steps: 10000
+  resume: null
+  output_dir: outputs/comparison/sparsh_episode_runs
+
+wandb:
+  name: SparshDINO-EpisodeSplit
+  group: sparsh_episode_split

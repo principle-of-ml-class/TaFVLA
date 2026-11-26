@@ -5,7 +5,24 @@ This repository implements only the tactile-force alignment adapter from
 It does not implement the VLA policy, action prediction, or downstream robot
 training.
 
+## Sparsh DINO Small
+
+공식 6채널 Sparsh DINO Small을 사용하는 설정과 검증·전처리 차이·실행 명령은
+[Sparsh 통합 문서](docs/sparsh_integration.md)를 참고하세요. 기존 ImageNet 설정도 유지합니다.
+
+```bash
+uv run python -m script.train_adapter --config-name=taf_adapter_sparsh --cfg job
+# GPU 0에서 N=5를 Rich dashboard + trainctl로 실행 (사용자가 시작)
+bash scripts/train_sparsh_windows.sh 5
+# 전체 N의 명령만 확인
+bash scripts/train_sparsh_windows.sh --dry-run
+```
+
 ## Architecture
+
+Sparsh의 episode 분할 실험은 `config/taf_adapter_sparsh_episode.yaml`을 사용합니다.
+분할 통계, 검증 결과와 N=5·10,000-step 실행 명령은
+[Episode Split 보고서](outputs/episode_split_validation/REPORT.md)에 정리했습니다.
 
 - `model/force_encoder.py`: independent pressure and 6-axis wrench MLP
   encoder/VQ/decoder branches. A complete temporal window is flattened before

@@ -157,7 +157,7 @@ def run_checks(cfg: DictConfig) -> None:
     validate_config(cfg)
     torch.manual_seed(int(cfg.training.seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    image_size = tuple(cfg.data.image_size)
+    image_size = tuple(cfg.data.image_size) if cfg.data.image_size is not None else (320, 240)
     pretrained = False if cfg.check.no_pretrained else bool(cfg.tactile_encoder.pretrained)
     print(f"Device: {device}")
     if not pretrained:

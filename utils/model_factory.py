@@ -30,6 +30,8 @@ def build_model(
     force_cfg = _plain_mapping(config["force_encoder"])
     vq_cfg = _plain_mapping(config["vq"])
     tactile_cfg = _plain_mapping(config["tactile_encoder"])
+    if tactile_cfg.get("backbone_type", "imagenet") == "sparsh" and data_cfg.get("frame_cache_enabled", False):
+        raise ValueError("Sparsh window pairing is incompatible with frame-index feature caching")
     loss_cfg = _plain_mapping(config["loss"])
     selected_window = int(data_cfg["window_size"] if window_size is None else window_size)
     tactile_cfg["max_window_size"] = max(

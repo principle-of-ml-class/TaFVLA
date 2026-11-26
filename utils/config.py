@@ -16,7 +16,7 @@ class DataConfig:
     root_dir: Optional[str] = None
     window_size: int = 5
     stride: int = 1
-    image_size: list[int] = field(default_factory=lambda: [224, 224])
+    image_size: Optional[list[int]] = field(default_factory=lambda: [224, 224])
     max_sequences: Optional[int] = None
     # Dataset accepts either one sensor name or a list; common validation checks it.
     sensor_types: Any = None
@@ -62,7 +62,22 @@ class VQConfig:
 
 
 @dataclass
+class SparshConfig:
+    repo_id: str = "facebook/sparsh-dino-small"
+    revision: str = "1aa732e94c1dd58294d4553e139c4bbe90e1ba35"
+    filename: str = "dino_vitsmall.safetensors"
+    sha256: str = "4126ba669f0fbe62b50893f46185d021f86d7a3dc671ac6397b2e9e3b9aeb8b8"
+    checkpoint_path: Optional[str] = None
+    temporal_stride: int = 5
+    pairing_mode: str = "window_clamp"
+    background_subtraction: bool = False
+    pooling: str = "attentive"
+    pooling_heads: int = 12
+
+
+@dataclass
 class TactileEncoderConfig:
+    backbone_type: str = "imagenet"
     backbone: str = "vit_small_patch16_224.augreg_in21k_ft_in1k"
     pretrained: bool = True
     freeze_backbone: bool = True
@@ -72,6 +87,7 @@ class TactileEncoderConfig:
     dropout: float = 0.1
     max_window_size: int = 20
     backbone_chunk_frames: int = 0
+    sparsh: SparshConfig = field(default_factory=SparshConfig)
 
 
 @dataclass

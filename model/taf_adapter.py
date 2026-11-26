@@ -197,6 +197,8 @@ class TaFAdapter(nn.Module):
         self, backbone_features: torch.Tensor, force: torch.Tensor, pressure: torch.Tensor
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         """Use cached frozen ViT outputs while training projection and temporal layers."""
+        if not self.tactile_encoder.supports_frame_cache:
+            raise ValueError("Sparsh window-paired features cannot use the frame-index cache path")
         projected = self.tactile_encoder.project_backbone_features(backbone_features)
         return self.forward_from_tactile_features(projected, force, pressure)
 

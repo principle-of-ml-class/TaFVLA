@@ -43,6 +43,8 @@ class FrozenFrameCache:
                  selected_ordinals: dict[Path, set[int]] | None = None,
                  max_open_files: int = 8) -> None:
         encoder = model.tactile_encoder
+        if not getattr(encoder, "supports_frame_cache", True):
+            raise ValueError("FrozenFrameCache is incompatible with Sparsh window pairing; use raw windows")
         if not encoder.freeze_backbone:
             raise ValueError("Frame caching requires a frozen backbone")
         if batch_size < 1:

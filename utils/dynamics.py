@@ -39,6 +39,16 @@ def sample_id(sensor: str, sequence: str, episode: int, anchor: int) -> str:
     return f"{sensor}/{sequence}/episode-{episode}/anchor-{anchor}"
 
 
+def split_group_key(row: dict, unit: str) -> str:
+    """Keep legacy sequence keys; episode keys include the sensor identity."""
+    if unit == "sequence":
+        return row["sequence_id"]
+    if unit != "episode":
+        raise ValueError(f"Unsupported split unit: {unit}")
+    return json.dumps([row["sensor_configuration"], row["sequence_id"],
+                       int(row["episode_index"])], separators=(",", ":"))
+
+
 def _digest(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as stream:
@@ -219,7 +229,8 @@ def create_manifest(dataset: TaFDataset, labels_path: Path, output: Path, *,
 class ManifestDataset(Dataset):
     """Read the same anchor list at any N, retaining the original raw sensor/video loader."""
 
-    def __init__(self, source: TaFDataset, manifest_path: Path, window_size: int):
+    def __init__(self, source: TaFDataset, manifest_path: Path, window_size: int,
+                 *, expected_split_unit: str | None = None):
         self.source = source
         self.window_size = window_size
         self.rows = pq.read_table(manifest_path).to_pylist()
@@ -228,6 +239,12 @@ class ManifestDataset(Dataset):
         if len({r["sample_id"] for r in self.rows}) != len(self.rows):
             raise ValueError("Manifest contains duplicate sample IDs")
         self.manifest_id = self.rows[0]["manifest_id"]
+        units = {r.get("split_unit", "sequence") for r in self.rows}
+        if len(units) != 1 or not units <= {"sequence", "episode"}:
+            raise ValueError("Manifest has mixed or invalid split units")
+        self.split_unit = next(iter(units))
+        if expected_split_unit is not None and self.split_unit != expected_split_unit:
+            raise ValueError("Manifest split_unit differs from data.split_unit")
         ep_lookup = {(e.sensor_type, e.sequence_id, e.episode_index): e for e in source.episodes}
         ep_order = {key: i for i, key in enumerate(ep_lookup)}
         self.episodes = source.episodes
@@ -236,12 +253,16 @@ class ManifestDataset(Dataset):
         counts = defaultdict(int)
         prior_position = (-1, -1)
         sequence_splits = {}
+        episode_splits = {}
         from utils.live_progress import emit as progress_event
         for row_index, row in enumerate(self.rows, 1):
             if row["split"] not in {"train", "validation", "test"}:
                 raise ValueError(f"Invalid manifest split: {row['split']}")
+            ep_key = (row["sensor_configuration"], row["sequence_id"], row["episode_index"])
+            if episode_splits.setdefault(ep_key, row["split"]) != row["split"]:
+                raise ValueError(f"Episode crosses splits: {ep_key}")
             previous_split = sequence_splits.setdefault(row["sequence_id"], row["split"])
-            if previous_split != row["split"]:
+            if self.split_unit == "sequence" and previous_split != row["split"]:
                 raise ValueError(f"Sequence crosses splits: {row['sequence_id']}")
             if row["dynamics5"] != dynamics5(row["contact_phase"], row["sudden_event"]):
                 raise ValueError(f"Manifest dynamics differs from source labels: {row['sample_id']}")
@@ -265,6 +286,13 @@ class ManifestDataset(Dataset):
                                total=len(self.rows), detail="anchors validated")
         # Explicit manifest order may not be episode-contiguous; samplers use _locate.
         self._ends = list(np.cumsum([counts[id(ep)] for ep in self.episodes]))
+        if self.split_unit == "episode" and "parent_manifest_id" in self.rows[0]:
+            from utils.episode_split import episode_manifest_identity
+            parents = {r["parent_manifest_id"] for r in self.rows}
+            seeds = {r["split_seed"] for r in self.rows}
+            if len(parents) != 1 or len(seeds) != 1 or self.manifest_id != episode_manifest_identity(
+                    next(iter(parents)), int(next(iter(seeds))), episode_splits):
+                raise ValueError("Episode manifest identity differs from actual episode assignment")
 
     def __len__(self):
         return len(self.rows)

@@ -39,7 +39,10 @@ def split_by_group(
         if unit == "sequence":
             key = episode.sequence_id
         else:
-            key = f"{episode.sequence_id}/episode-{episode.episode_index}"
+            from utils.dynamics import split_group_key
+            key = split_group_key({"sensor_configuration": episode.sensor_type,
+                                   "sequence_id": episode.sequence_id,
+                                   "episode_index": episode.episode_index}, "episode")
         groups[key].append(episode_id)
     keys = sorted(groups)
     if len(keys) < 2:

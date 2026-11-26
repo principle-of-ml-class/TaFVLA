@@ -18,7 +18,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Subset
 
 from dataset.taf_dataset import TaFDataset
-from utils.dynamics import ManifestDataset
+from utils.dynamics import ManifestDataset, split_group_key
 from utils.comparison_eval import write_rows
 from utils.alignment import (
     AlignmentSelection,
@@ -33,6 +33,7 @@ from utils.alignment import (
     should_run_step_alignment,
 )
 from utils.checkpoint import (
+    assert_tactile_checkpoint_compatible,
     capture_rng,
     load_checkpoint,
     restore_rng,
@@ -195,6 +196,14 @@ def run_training(cfg: DictConfig) -> None:
     """Run training from a fully composed and validated Hydra config."""
     validate_config(cfg, require_data_root=True)
     train_cfg, data_cfg = cfg.training, cfg.data
+    resume_path = resolve_path(train_cfg.resume) if train_cfg.resume else None
+    checkpoint = load_checkpoint(resume_path) if resume_path else None
+    if checkpoint is not None:
+        assert_tactile_checkpoint_compatible(checkpoint, cfg)
+        if bool(cfg.comparison.enabled):
+            saved_unit = checkpoint["config"]["data"].get("split_unit", "sequence")
+            if saved_unit != str(data_cfg.split_unit):
+                raise ValueError("Resume checkpoint split unit differs; use fresh training for a new split")
     sampler_mode = str(train_cfg.get("batch_sampler", "auto"))
     seed = int(train_cfg.seed)
     set_seed(seed)
@@ -207,7 +216,7 @@ def run_training(cfg: DictConfig) -> None:
         resolve_path(data_cfg.root_dir),
         window_size=1 if comparison else int(data_cfg.window_size),
         stride=int(data_cfg.stride),
-        image_size=tuple(data_cfg.image_size),
+        image_size=tuple(data_cfg.image_size) if data_cfg.image_size is not None else None,
         sensor_types=data_cfg.sensor_types,
         max_sequences=data_cfg.max_sequences,
         skip_invalid_sequences=bool(data_cfg.skip_invalid_sequences),
@@ -238,7 +247,8 @@ def run_training(cfg: DictConfig) -> None:
     progress_event("Temporal Alignment Audit", "Completed", current=len(source.episodes),
                    total=len(source.episodes))
     progress_event("Manifest Loading & Validation", detail="reading manifest" if comparison else "standard mode")
-    dataset = ManifestDataset(source, resolve_path(cfg.comparison.manifest), int(data_cfg.window_size)) if comparison else source
+    dataset = ManifestDataset(source, resolve_path(cfg.comparison.manifest), int(data_cfg.window_size),
+                              expected_split_unit=str(data_cfg.split_unit)) if comparison else source
     progress_event("Manifest Loading & Validation", "Completed",
                    current=len(dataset.rows) if comparison else None,
                    total=len(dataset.rows) if comparison else None)
@@ -250,8 +260,8 @@ def run_training(cfg: DictConfig) -> None:
             raise ValueError("Manifest must contain nonempty train, validation and test splits")
         ids = {id(ep): i for i, ep in enumerate(dataset.episodes)}
         train_eps = {ids[id(dataset._locate(i)[0])] for i in train_indices}
-        train_keys = sorted({dataset.rows[i]["sequence_id"] for i in train_indices})
-        val_keys = sorted({dataset.rows[i]["sequence_id"] for i in val_indices})
+        train_keys = sorted({split_group_key(dataset.rows[i], dataset.split_unit) for i in train_indices})
+        val_keys = sorted({split_group_key(dataset.rows[i], dataset.split_unit) for i in val_indices})
         if int(dataset.rows[0]["split_seed"]) != int(data_cfg.split_seed):
             raise ValueError("Manifest split_seed differs from data.split_seed")
         gallery_path = resolve_path(cfg.comparison.manifest).with_name("gallery_plan.json")
@@ -274,6 +284,8 @@ def run_training(cfg: DictConfig) -> None:
         # Preserve old comparison identities when using the legacy default.
         if sampler_mode != "auto":
             comparison_identity["batch_sampler"] = sampler_mode
+        if dataset.split_unit != "sequence":
+            comparison_identity["split_unit"] = dataset.split_unit
         cfg.wandb.name = f"{cfg.wandb.name}_{suffix}_{dataset.manifest_id[:8]}" if cfg.wandb.name else f"{suffix}_{dataset.manifest_id[:8]}"
     else:
         split = split_by_group(dataset, unit=str(data_cfg.split_unit),
@@ -286,9 +298,7 @@ def run_training(cfg: DictConfig) -> None:
         f"validation={len(val_indices)} windows/{len(val_keys)} groups"
     )
 
-    resume_path = resolve_path(train_cfg.resume) if train_cfg.resume else None
     progress_event("Normalization")
-    checkpoint = load_checkpoint(resume_path) if resume_path else None
     if checkpoint is not None:
         if comparison and checkpoint.get("comparison_identity") != comparison_identity:
             raise ValueError("Resume checkpoint comparison identity differs from current manifest/N/seeds")
@@ -513,6 +523,18 @@ def run_training(cfg: DictConfig) -> None:
         # Experiment tracking must not change training randomness.
         restore_rng_state(rng_before_wandb)
 
+    backbone_metadata = model.tactile_encoder.checkpoint_identity()
+    backbone_metadata.update(
+        window_size=int(data_cfg.window_size), forward_batch_size=int(train_cfg.batch_size),
+        backbone_chunk_frames=int(cfg.tactile_encoder.backbone_chunk_frames),
+        frozen_parameters=sum(p.numel() for p in model.parameters() if not p.requires_grad),
+        trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad),
+    )
+    logger.write({"record_type": "tactile_backbone", **backbone_metadata})
+    logger.message(f"Tactile backbone: {json.dumps(backbone_metadata)}")
+    if logger.run is not None:
+        logger.run.summary["tactile_backbone"] = backbone_metadata
+
     max_steps = int(train_cfg.max_steps)
     started = time.time()
     prior_duration = float(checkpoint.get("training_duration_seconds", 0.0)) if checkpoint is not None else 0.0
@@ -571,6 +593,7 @@ def run_training(cfg: DictConfig) -> None:
         "output_dir": str(output_dir),
         "resume": str(resume_path) if resume_path else None,
         "wandb_url": logger.wandb_url(),
+        "backbone_metadata": backbone_metadata,
     })
     reporter.start(
         name=wandb_state.get("run_name"), total_steps=max_steps,
@@ -1225,7 +1248,7 @@ def run_training(cfg: DictConfig) -> None:
                 "loss_mode": str(cfg.loss.nce_mode),
                 "split_seed": int(data_cfg.split_seed),
                 "stride": int(data_cfg.stride),
-                "image_size": list(data_cfg.image_size),
+                "image_size": list(data_cfg.image_size) if data_cfg.image_size is not None else None,
                 "backbone": str(cfg.tactile_encoder.backbone),
             })
             summary_metrics = {

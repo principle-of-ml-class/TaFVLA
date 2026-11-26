@@ -59,7 +59,7 @@ def main(cfg: DictConfig) -> None:
         resolve_path(data_cfg.root_dir),
         window_size=int(data_cfg.window_size),
         stride=int(data_cfg.stride),
-        image_size=tuple(data_cfg.image_size),
+        image_size=tuple(data_cfg.image_size) if data_cfg.image_size is not None else None,
         sensor_types=data_cfg.sensor_types,
         max_sequences=data_cfg.max_sequences,
         skip_invalid_sequences=bool(data_cfg.skip_invalid_sequences),

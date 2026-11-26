@@ -21,12 +21,13 @@ from utils.checkpoint import load_checkpoint
 from utils.comparison_eval import (evaluate_probe, evaluate_retrieval, save_gallery_plan,
                                    write_rows)
 from utils.dynamics import ManifestDataset, create_manifest, DYNAMICS
+from utils.episode_split import repartition_episode_manifest, prepare_episode_assets
 from utils.model_factory import build_model
 from utils.logging import ExperimentLogger
 
 
 def source_from_config(root, data):
-    return TaFDataset(root, window_size=1, stride=1, image_size=tuple(data.image_size),
+    return TaFDataset(root, window_size=1, stride=1, image_size=tuple(data.image_size) if data.image_size is not None else None,
                       sensor_types=data.sensor_types, max_sequences=data.max_sequences,
                       skip_invalid_sequences=bool(data.skip_invalid_sequences),
                       timestamp_cache_enabled=bool(data.timestamp_cache_enabled),
@@ -43,10 +44,11 @@ def load_run(args):
     manifest = Path(args.manifest or config.comparison.manifest)
     root = args.data_root or config.data.root_dir
     source = source_from_config(root, config.data)
-    dataset = ManifestDataset(source, manifest, int(identity["window_size"]))
+    dataset = ManifestDataset(source, manifest, int(identity["window_size"]),
+                              expected_split_unit=str(config.data.split_unit))
     if dataset.manifest_id != identity["manifest_id"]:
         raise ValueError("Checkpoint and manifest identities differ")
-    model = build_model(config, pretrained=False)
+    model = build_model(config, pretrained=False if config.tactile_encoder.get("backbone_type", "imagenet") == "imagenet" else None)
     model.load_state_dict(checkpoint["model"])
     device = torch.device(args.device)
     model.to(device).eval()
@@ -168,6 +170,12 @@ def main():
     manifest.add_argument("--gallery-seed", type=int, default=42)
     manifest.add_argument("--gallery-max-pairs", type=int, default=256)
     manifest.add_argument("--gallery-min-gap", type=int, default=20)
+    episode = sub.add_parser("episode-split", help="Repartition existing anchors and prepare train-only statistics")
+    episode.add_argument("--manifest", default="metadata/manifest.parquet")
+    episode.add_argument("--output", default="metadata/episode_split/manifest.parquet")
+    episode.add_argument("--split-seed", type=int, default=42)
+    episode.add_argument("--original-gallery")
+    episode.add_argument("--config-name", default="taf_adapter_sparsh_episode")
     for command in ("retrieval", "probe"):
         item = sub.add_parser(command)
         item.add_argument("--checkpoint", required=True)
@@ -183,7 +191,14 @@ def main():
     summary.add_argument("--results", nargs="+", required=True)
     summary.add_argument("--output", required=True)
     args = parser.parse_args()
-    if args.command == "manifest":
+    if args.command == "episode-split":
+        report = repartition_episode_manifest(Path(args.manifest), Path(args.output), seed=args.split_seed)
+        assets = prepare_episode_assets(Path(args.output), config_name=args.config_name,
+                                       original_gallery=Path(args.original_gallery) if args.original_gallery else
+                                       Path(args.manifest).with_name("gallery_plan.json"))
+        print(json.dumps({k: v for k, v in report.items() if k != "episode_assignments"}, indent=2))
+        print(json.dumps({k: v for k, v in assets.items() if k != "normalization_values"}, indent=2))
+    elif args.command == "manifest":
         source = TaFDataset(args.data_root, window_size=1, stride=1, max_sequences=args.max_sequences)
         report = create_manifest(source, Path(args.labels), Path(args.output), split_seed=args.split_seed,
                                  fractions=tuple(args.fractions), timestamp_tolerance=args.timestamp_tolerance,

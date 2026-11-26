@@ -13,6 +13,49 @@ from omegaconf import DictConfig
 from utils.common import resolved_config
 
 
+def tactile_signature(config) -> dict[str, Any]:
+    """Semantic identity; paths may differ but pretrained bytes/protocol may not."""
+    tactile = config["tactile_encoder"]
+    kind = tactile.get("backbone_type", "imagenet")
+    result = {"backbone_type": kind, "backbone": tactile["backbone"]}
+    if kind == "sparsh":
+        options = tactile["sparsh"]
+        result.update({key: options[key] for key in ["repo_id", "revision", "filename", "sha256",
+                      "temporal_stride", "pairing_mode", "background_subtraction", "pooling", "pooling_heads"]})
+        result["preprocessing_version"] = 1
+    return result
+
+
+def assert_tactile_checkpoint_compatible(checkpoint, config) -> None:
+    if "config" not in checkpoint:
+        raise ValueError("Resume checkpoint has no backbone configuration identity")
+    current = tactile_signature(config)
+    saved = tactile_signature(checkpoint["config"])
+    if current != saved:
+        raise ValueError("Resume tactile backbone/input protocol mismatch; ImageNet and Sparsh checkpoints are incompatible")
+    metadata = checkpoint.get("tactile_backbone")
+    if metadata is not None and metadata["backbone_type"] != current["backbone_type"]:
+        raise ValueError("Checkpoint backbone metadata disagrees with configuration")
+    if current["backbone_type"] == "sparsh":
+        from model.sparsh import UPSTREAM_REVISION
+        if metadata is None:
+            raise ValueError("Sparsh resume checkpoint is missing pretrained backbone identity")
+        for key in ["repo_id", "revision", "filename", "sha256"]:
+            if metadata["pretrained"].get(key) != current[key]:
+                raise ValueError(f"Sparsh checkpoint pretrained identity mismatch: {key}")
+        for key in ["temporal_stride", "pairing_mode", "background_subtraction", "pooling_heads"]:
+            if metadata["input_protocol"].get(key) != current[key]:
+                raise ValueError(f"Sparsh checkpoint input protocol mismatch: {key}")
+        protocol = metadata["input_protocol"]
+        if (metadata["pretrained"].get("upstream_revision") != UPSTREAM_REVISION
+                or protocol.get("version") != 1
+                or protocol.get("pooling") != "attentive_patch_only"
+                or tuple(protocol.get("resolution", ())) != (320, 240)
+                or protocol.get("channel_order") != "current_RGB,reference_RGB"
+                or protocol.get("geometry") != "official_orientation_crop_tensor_bilinear_antialias"):
+            raise ValueError("Sparsh checkpoint pooling/preprocessing implementation mismatch")
+
+
 def load_checkpoint(path: Path) -> dict[str, Any]:
     """Load current or pre-refactor checkpoints without requiring new fields."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -65,6 +108,8 @@ def save_checkpoint(
         "split": {"train_groups": train_keys, "validation_groups": val_keys},
         "rng": capture_rng(),
     }
+    if hasattr(model, "tactile_encoder") and hasattr(model.tactile_encoder, "checkpoint_identity"):
+        payload["tactile_backbone"] = model.tactile_encoder.checkpoint_identity()
     if wandb_state:
         payload["wandb"] = dict(wandb_state)
     if alignment_state is not None:

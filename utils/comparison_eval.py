@@ -58,11 +58,12 @@ def gallery_selection(rows: list[dict], split: str, *, seed: int, max_pairs: int
 
 
 def save_gallery_plan(rows: list[dict], path: Path, *, seed: int, max_pairs: int,
-                      min_gap: int = 20) -> dict:
+                      min_gap: int = 20, preserved_test_ids: list[str] | None = None) -> dict:
     if max_pairs < 2 or min_gap < 20:
         raise ValueError("Comparison gallery requires max_pairs >= 2 and min_gap >= 20")
-    plan = {split: gallery_selection(rows, split, seed=seed, max_pairs=max_pairs, min_gap=min_gap)
-            for split in ("validation", "test")}
+    plan = {"validation": gallery_selection(rows, "validation", seed=seed, max_pairs=max_pairs, min_gap=min_gap),
+            "test": (list(preserved_test_ids) if preserved_test_ids is not None else
+                     gallery_selection(rows, "test", seed=seed, max_pairs=max_pairs, min_gap=min_gap))}
     for split in ("validation", "test"):
         if len(plan[split]) < 2:
             raise ValueError(f"{split} gallery has {len(plan[split])} pair(s); at least two are required. "
@@ -70,6 +71,19 @@ def save_gallery_plan(rows: list[dict], path: Path, *, seed: int, max_pairs: int
     plan.update(seed=seed, max_pairs=max_pairs, min_gap=min_gap,
                 manifest_id=rows[0]["manifest_id"])
     lookup = {r["sample_id"]: r for r in rows}
+    for split in ("validation", "test"):
+        ids = plan[split]
+        if len(ids) != len(set(ids)) or len(ids) > max_pairs:
+            raise ValueError(f"Invalid {split} gallery size/duplicate IDs")
+        anchors = defaultdict(list)
+        for sid in ids:
+            row = lookup.get(sid)
+            if row is None or row["split"] != split:
+                raise ValueError(f"Gallery sample does not belong to {split}: {sid}")
+            anchors[(row["sensor_configuration"], row["sequence_id"], row["episode_index"])].append(row["anchor_frame_position"])
+        if any(b-a < min_gap for values in anchors.values()
+               for a, b in zip(sorted(values), sorted(values)[1:])):
+            raise ValueError(f"{split} gallery violates minimum anchor gap")
     plan["support"] = {}
     for split in ("validation", "test"):
         selected = [lookup[s] for s in plan[split]]

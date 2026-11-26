@@ -34,6 +34,7 @@ _CONFIG_KEYS = {
     "tactile_encoder": {
         "backbone", "pretrained", "freeze_backbone", "transformer_dim",
         "transformer_layers", "num_heads", "dropout", "max_window_size", "backbone_chunk_frames",
+        "backbone_type", "sparsh",
     },
     "loss": {"lambda_quant", "lambda_recon", "temperature", "nce_mode"},
     "training": {
@@ -175,10 +176,11 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         raise TypeError("data.root_dir must be null or a path string")
     _integer(data.window_size, "data.window_size", minimum=1)
     _integer(data.stride, "data.stride", minimum=1)
-    if not isinstance(data.image_size, (list, tuple, ListConfig)) or len(data.image_size) != 2:
-        raise TypeError("data.image_size must contain [height, width]")
-    for index, size in enumerate(data.image_size):
-        _integer(size, f"data.image_size[{index}]", minimum=1)
+    if data.image_size is not None:
+        if not isinstance(data.image_size, (list, tuple, ListConfig)) or len(data.image_size) != 2:
+            raise TypeError("data.image_size must contain [height, width] or null for native images")
+        for index, size in enumerate(data.image_size):
+            _integer(size, f"data.image_size[{index}]", minimum=1)
     if data.max_sequences is not None:
         _integer(data.max_sequences, "data.max_sequences", minimum=1)
     if data.sensor_types is not None:
@@ -239,6 +241,32 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
     _number(vq.commitment_beta, "vq.commitment_beta", minimum=0.0)
 
     tactile = sections["tactile_encoder"]
+    if tactile.get("backbone_type", "imagenet") not in {"imagenet", "sparsh"}:
+        raise ValueError("tactile_encoder.backbone_type must be imagenet or sparsh")
+    if tactile.get("backbone_type", "imagenet") == "sparsh":
+        from model.sparsh import REPO_ID, REVISION, FILENAME, SHA256
+        sparsh = tactile.sparsh
+        allowed = {"repo_id", "revision", "filename", "sha256", "checkpoint_path", "temporal_stride",
+                   "pairing_mode", "background_subtraction", "pooling", "pooling_heads"}
+        if set(sparsh) != allowed:
+            raise ValueError("Sparsh keys do not match the schema")
+        if [sparsh.repo_id, sparsh.revision, sparsh.filename, sparsh.sha256] != [REPO_ID, REVISION, FILENAME, SHA256]:
+            raise ValueError("Sparsh requires the pinned official DINO Small checkpoint identity")
+        if not tactile.pretrained or tactile.backbone != "sparsh-dino-small":
+            raise ValueError("Sparsh requires pretrained=true and backbone=sparsh-dino-small")
+        if data.frame_cache_enabled:
+            raise ValueError("Sparsh cannot use FrozenFrameCache with window-dependent pairing")
+        if data.image_size is not None:
+            raise ValueError("Sparsh requires data.image_size=null; native images must reach its preprocessing")
+        _integer(sparsh.temporal_stride, "tactile_encoder.sparsh.temporal_stride", minimum=1)
+        _integer(sparsh.pooling_heads, "tactile_encoder.sparsh.pooling_heads", minimum=1)
+        if 384 % sparsh.pooling_heads:
+            raise ValueError("Sparsh pooling_heads must divide 384")
+        if sparsh.pairing_mode != "window_clamp" or sparsh.pooling != "attentive":
+            raise ValueError("Sparsh requires window_clamp pairing and attentive pooling")
+        _boolean(sparsh.background_subtraction, "tactile_encoder.sparsh.background_subtraction")
+        if sparsh.checkpoint_path is not None and (not isinstance(sparsh.checkpoint_path, str) or not sparsh.checkpoint_path):
+            raise ValueError("Sparsh checkpoint_path must be null or a nonempty path")
     if not isinstance(tactile.backbone, str) or not tactile.backbone:
         raise TypeError("tactile_encoder.backbone must be a non-empty string")
     _boolean(tactile.pretrained, "tactile_encoder.pretrained")
@@ -359,8 +387,8 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
             raise ValueError("data.window_size must be in comparison.window_sizes and within tactile max")
         if training.min_same_episode_window_gap < comparison.min_anchor_gap:
             raise ValueError("training.min_same_episode_window_gap must meet comparison.min_anchor_gap")
-        if data.stride != 1 or data.split_unit != "sequence":
-            raise ValueError("comparison mode requires stride=1 and sequence split")
+        if data.stride != 1:
+            raise ValueError("comparison mode requires stride=1")
         if list(comparison.window_sizes) != [1, 3, 5, 7, 10, 20]:
             raise ValueError("comparison.window_sizes must be [1, 3, 5, 7, 10, 20]")
         if tactile.max_window_size < 20 or comparison.min_anchor_gap < 20:

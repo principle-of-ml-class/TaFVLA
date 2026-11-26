@@ -1,0 +1,43 @@
+defaults:
+  - taf_adapter_alignment_test
+  - _self_
+
+data:
+  root_dir: /ssdg/spl_yeongyoo/taf_dataset
+  window_size: 5
+  # Preserve native geometry until the official Sparsh orientation/crop/resize.
+  image_size: null
+  frame_cache_enabled: false
+  sensor_mmap_enabled: true
+
+tactile_encoder:
+  backbone_type: sparsh
+  backbone: sparsh-dino-small
+  pretrained: true
+  freeze_backbone: true
+  backbone_chunk_frames: 32
+  sparsh:
+    repo_id: facebook/sparsh-dino-small
+    revision: 1aa732e94c1dd58294d4553e139c4bbe90e1ba35
+    filename: dino_vitsmall.safetensors
+    sha256: 4126ba669f0fbe62b50893f46185d021f86d7a3dc671ac6397b2e9e3b9aeb8b8
+    temporal_stride: 5
+    pairing_mode: window_clamp
+    background_subtraction: false
+    pooling: attentive
+    pooling_heads: 12
+
+training:
+  resume: null
+  output_dir: outputs/comparison/sparsh_runs
+
+comparison:
+  enabled: true
+  manifest: metadata/manifest.parquet
+
+wandb:
+  enabled: true
+  project: TaF-Adapter
+  name: SparshDINO
+  group: sparsh_dino
+  tags: [taf-vla, sparsh, tactile-pretrained, window-clamp]

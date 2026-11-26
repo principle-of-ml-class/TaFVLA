@@ -373,7 +373,7 @@ def main():
     with initialize_config_dir(version_base="1.3", config_dir=config_directory):
         base_cfg = compose(config_name="taf_adapter", overrides=args.override)
     init = time.perf_counter()
-    source = TaFDataset(args.data_root, window_size=1, image_size=tuple(base_cfg.data.image_size),
+    source = TaFDataset(args.data_root, window_size=1, image_size=tuple(base_cfg.data.image_size) if base_cfg.data.image_size is not None else None,
                         stride=int(base_cfg.data.stride), sensor_types=base_cfg.data.sensor_types,
                         timestamp_cache_enabled=bool(base_cfg.data.timestamp_cache_enabled),
                         timestamp_cache_dir=base_cfg.data.timestamp_cache_dir,
