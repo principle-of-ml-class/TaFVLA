@@ -59,6 +59,10 @@ class VQConfig:
     pressure_codebook_size: int = 512
     force_codebook_size: int = 512
     commitment_beta: float = 0.25
+    initialization: str = "uniform"
+    kmeans_samples: int = 16384
+    kmeans_iters: int = 20
+    kmeans_seed: int = 42
 
 
 @dataclass
@@ -99,6 +103,14 @@ class LossConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    type: str = "constant"
+    warmup_steps: int = 500
+    warmup_start_factor: float = 0.01
+    min_lr: float = 1.0e-5
+
+
+@dataclass
 class TrainingConfig:
     batch_size: int = 32
     gradient_accumulation_steps: int = 1
@@ -120,6 +132,7 @@ class TrainingConfig:
     min_same_episode_window_gap: int = 5
     # auto preserves legacy comparison and standard training behavior.
     batch_sampler: str = "auto"
+    scheduler: Optional[SchedulerConfig] = field(default_factory=SchedulerConfig)
 
 
 @dataclass

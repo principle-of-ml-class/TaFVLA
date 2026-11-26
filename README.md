@@ -18,11 +18,27 @@ bash scripts/train_sparsh_windows.sh 5
 bash scripts/train_sparsh_windows.sh --dry-run
 ```
 
+Dashboard는 기존 metrics를 시작하자마자 읽습니다. `--metrics`가 trainctl의
+`--checkpoint-dir/metrics.jsonl`과 다르거나 경로 변수가 비어 있으면 학습을 시작하기 전에 오류를 냅니다.
+이미 실행 중이거나 완료된 Episode Split 결과만 보려면 다음 조회 모드를 사용합니다.
+학습을 새로 시작하지 않으며, 조회 화면에서 Ctrl+C를 눌러도 학습을 종료하지 않습니다.
+
+```bash
+uv run python -m script.terminal_monitor \
+  --metrics outputs/comparison/sparsh_episode_runs/15f131e8_N5_seed42/metrics.jsonl \
+  --total-steps 10000 --watch
+# 한 번만 출력하고 종료하려면 --once 추가
+```
+
 ## Architecture
 
 Sparsh의 episode 분할 실험은 `config/taf_adapter_sparsh_episode.yaml`을 사용합니다.
 분할 통계, 검증 결과와 N=5·10,000-step 실행 명령은
 [Episode Split 보고서](outputs/episode_split_validation/REPORT.md)에 정리했습니다.
+
+K-means 초기화와 Linear Warmup + Cosine LR을 사용하는 설정은
+`taf_adapter_sparsh_episode_stable`입니다.
+[학습 안정성 설정·검증·실행 명령](docs/training_stability.md)을 참고하세요.
 
 - `model/force_encoder.py`: independent pressure and 6-axis wrench MLP
   encoder/VQ/decoder branches. A complete temporal window is flattened before
@@ -327,10 +343,11 @@ uv run python -m script.train_adapter \
 The final resolved Hydra config and the W&B run ID/name are recorded. Training
 and validation log total, InfoNCE, quantization, codebook, commitment, pressure
 and force reconstruction losses; positive/negative cosine; recall@1/5; and
-pressure/force codebook perplexity. Detailed codebook used count, usage
-fraction, and dead-code count are intentionally excluded from W&B, but the
-model still computes them and the unfiltered values remain in `metrics.jsonl`.
-W&B also receives learning rate, gradient norm, epoch, elapsed time, and the
+pressure/force codebook perplexity. Codebook used count, usage fraction,
+dead-code count, latent/vector norms, quantization distance and assignment
+entropy are retained in both W&B and `metrics.jsonl`.
+W&B also receives learning rate, scheduler step, clipping diagnostics,
+module gradient norms, AMP skipped update count, epoch, elapsed time, and the
 actual optimizer step as its global step. No additional model forward pass is
 made for logging, and datasets/checkpoints are not uploaded as artifacts.
 

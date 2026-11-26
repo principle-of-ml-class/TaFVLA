@@ -103,8 +103,7 @@ wandb:
   tags: ["taf-vla", "pretraining"]
   mode: "online"
   # Native scalar histories use global_step; README explains overlay panels.
-  # W&B keeps only pressure/force perplexity for codebook diversity, while
-  # metrics.jsonl retains every codebook diagnostic.
+  # W&B and metrics.jsonl both retain codebook stability diagnostics.
   log_every: 20
   watch_model: false
 

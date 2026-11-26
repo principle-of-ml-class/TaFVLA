@@ -147,7 +147,16 @@ class TaFAdapter(nn.Module):
             force_outputs["reconstructed_pressure"] * self.pressure_std + self.pressure_mean
         )
         reconstructed_force = force_outputs["reconstructed_force"] * self.force_std + self.force_mean
+        diagnostics = {}
+        with torch.no_grad():
+            for name, quantizer, perplexity in (("pressure", p_quantizer, p_perplexity),
+                                                ("force", f_quantizer, f_perplexity)):
+                diagnostics[f"{name}_pre_vq_latent_norm"] = force_outputs[f"z_{name}"].detach().float().norm(dim=-1).mean()
+                diagnostics[f"{name}_codebook_vector_norm"] = quantizer.codebook.weight.detach().float().norm(dim=-1).mean()
+                diagnostics[f"{name}_quantization_distance"] = force_outputs[f"loss_codebook_{name}"].detach()
+                diagnostics[f"{name}_assignment_entropy"] = perplexity.log()
         return {
+            **diagnostics,
             "z_tactile": z_tactile,
             "c_force": force_outputs["c_force"],
             "c_pressure": force_outputs["c_pressure"],

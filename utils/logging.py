@@ -23,19 +23,11 @@ METRIC_KEYS = (
     "pressure_codebook_usage_fraction", "force_codebook_usage_fraction",
     "pressure_codebook_perplexity", "force_codebook_perplexity",
     "pressure_dead_codes", "force_dead_codes",
+    "pressure_pre_vq_latent_norm", "force_pre_vq_latent_norm",
+    "pressure_codebook_vector_norm", "force_codebook_vector_norm",
+    "pressure_quantization_distance", "force_quantization_distance",
+    "pressure_assignment_entropy", "force_assignment_entropy",
 )
-
-# 모델은 아래 값을 계속 계산하고 JSONL에도 모두 보존한다. W&B 대시보드만
-# 대표 다양성 지표인 perplexity 두 개로 단순화한다.
-WANDB_EXCLUDED_CODEBOOK_METRICS = frozenset({
-    "pressure_codebook_usage",
-    "force_codebook_usage",
-    "pressure_codebook_usage_fraction",
-    "force_codebook_usage_fraction",
-    "pressure_dead_codes",
-    "force_dead_codes",
-})
-
 
 def scalar_metrics(outputs: dict[str, Any]) -> dict[str, float]:
     """모델 출력 Tensor를 파일과 화면에 기록할 Python scalar로 변환한다."""
@@ -67,17 +59,8 @@ class DeviceMetricAccumulator:
 
 
 def filter_wandb_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
-    """W&B에서만 상세 codebook 사용량 지표를 제외한다.
-
-    ``train/pressure_codebook_usage``처럼 namespace가 붙은 키와 namespace가
-    없는 키를 모두 처리한다. 입력 dictionary는 수정하지 않으므로 같은 값이
-    JSONL 기록이나 checkpoint 상태에 사용되어도 영향이 없다.
-    """
-    return {
-        key: value
-        for key, value in metrics.items()
-        if key.rsplit("/", maxsplit=1)[-1] not in WANDB_EXCLUDED_CODEBOOK_METRICS
-    }
+    """학습 안정성 진단을 JSONL과 W&B에 동일하게 보존한다."""
+    return dict(metrics)
 
 
 class TrainingProgress:
@@ -144,6 +127,8 @@ class TrainingProgress:
         value = metrics.get(key)
         if value is None:
             return "   --   "
+        if key.endswith("learning_rate"):
+            return f"{float(value):8.2e}"
         return f"{float(value):8.4f}"
 
     def _dashboard_text(self) -> list[str]:
@@ -176,6 +161,10 @@ class TrainingProgress:
                 + self._value(train, "train/pressure_codebook_perplexity")
                 + " | Force PPL "
                 + self._value(train, "train/force_codebook_perplexity")
+                + " | LR " + self._value(train, "train/learning_rate")
+                + " " + str(train.get("train/scheduler_phase", ""))
+                + " | Grad " + self._value(train, "train/gradient_norm")
+                + " | Clip " + self._value(train, "train/gradient_clipping_coefficient")
             ),
             (
                 f"Val @ {val_step_text}   | Total " + self._value(val, "val/loss_total")
@@ -245,6 +234,10 @@ class TrainingProgress:
             f"recon={self._value(metrics, 'train/loss_recon').strip()} "
             f"pressure_ppl={self._value(metrics, 'train/pressure_codebook_perplexity').strip()} "
             f"force_ppl={self._value(metrics, 'train/force_codebook_perplexity').strip()}"
+            f" lr={self._value(metrics, 'train/learning_rate').strip()}"
+            f" phase={metrics.get('train/scheduler_phase', '--')}"
+            f" grad={self._value(metrics, 'train/gradient_norm').strip()}"
+            f" clip={self._value(metrics, 'train/gradient_clipping_coefficient').strip()}"
         )
 
     def update_validation(self, metrics: dict[str, Any]) -> None:

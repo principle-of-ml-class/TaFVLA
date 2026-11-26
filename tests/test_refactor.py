@@ -358,14 +358,14 @@ class RefactorSmokeTests(unittest.TestCase):
             self.assertIn("train/pressure_codebook_perplexity", payload)
             self.assertIn("val/force_codebook_perplexity", payload)
             self.assertIn("val/recall_at_1", payload)
-            excluded_names = (
+            codebook_names = (
                 "pressure_codebook_usage", "force_codebook_usage",
                 "pressure_codebook_usage_fraction", "force_codebook_usage_fraction",
                 "pressure_dead_codes", "force_dead_codes",
             )
             for prefix in ("train", "val"):
-                for name in excluded_names:
-                    self.assertNotIn(f"{prefix}/{name}", payload)
+                for name in codebook_names:
+                    self.assertIn(f"{prefix}/{name}", payload)
             with self.assertRaisesRegex(ValueError, "must increase monotonically"):
                 logger.log_wandb({"train/loss_total": 1.0}, step=5)
             logger.log_wandb(

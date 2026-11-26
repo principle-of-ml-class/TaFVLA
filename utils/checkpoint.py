@@ -95,6 +95,8 @@ def save_checkpoint(
     alignment_state: dict[str, Any] | None = None,
     comparison_identity: dict[str, Any] | None = None,
     training_duration_seconds: float | None = None,
+    scheduler_state: dict[str, Any] | None = None,
+    stability_state: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -123,6 +125,10 @@ def save_checkpoint(
         }
     if training_duration_seconds is not None:
         payload["training_duration_seconds"] = float(training_duration_seconds)
+    if scheduler_state is not None:
+        payload["scheduler"] = scheduler_state
+    if stability_state is not None:
+        payload["stability"] = stability_state
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)

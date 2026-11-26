@@ -23,7 +23,7 @@ from utils.live_progress import PREFIX
 
 STAGES = (
     "Dataset Initialization", "Temporal Alignment Audit", "Manifest Loading & Validation",
-    "Normalization", "Model / Optimizer Initialization", "Training Sampler Initialization",
+    "Normalization", "Model / Optimizer Initialization", "Codebook Initialization", "Training Sampler Initialization",
     "Validation Sampler Initialization", "W&B / trainctl Initialization", "Training Ready",
 )
 
@@ -90,7 +90,10 @@ def _stop_tree(process: subprocess.Popen, signum: int) -> None:
 class Monitor:
     def __init__(self, metrics_path: Path, total_steps: int, *, tty: bool | None = None):
         self.metrics_path = metrics_path
-        self.metrics_offset = metrics_path.stat().st_size if metrics_path.exists() else 0
+        # A resumed run or an attached dashboard must show the existing step
+        # immediately, even before the next metrics record is appended.
+        self.metrics_offset = 0
+        self._metrics_initialized = False
         self.total_steps = total_steps
         self.tty = sys.stdout.isatty() if tty is None else tty
         self.console = Console(force_terminal=self.tty)
@@ -134,18 +137,27 @@ class Monitor:
             raw = m.get(key)
             return f"{raw:.4g}" if isinstance(raw, (int, float)) else "—"
         step = int(m.get("step", 0))
-        elapsed = time.monotonic() - self.started
+        elapsed = m.get("perf/elapsed_seconds", m.get("seconds", time.monotonic() - self.started))
         rate = m.get("perf/steps_per_second", 0)
         eta = (self.total_steps - step) / rate if rate else None
         cpu_rss_key = "perf/total_rss_gib" if "perf/total_rss_gib" in m else "perf/cpu_rss_gib"
         cpu_peak_key = ("perf/total_peak_sampled_rss_gib" if "perf/total_peak_sampled_rss_gib" in m
                         else "perf/cpu_peak_rss_gib")
-        training.add_row(f"{step}/{self.total_steps}", value("train/loss_total"), value("val/loss_total"),
+        step_label = str(step) if "step" in m else "—"
+        training.add_row(f"{step_label}/{self.total_steps}", value("train/loss_total"), value("val/loss_total"),
                          f"{value('alignment/t2f/recall_at_1')} / {value('alignment/f2t/recall_at_1')}",
                          f"{rate:.2f} steps/s" if rate else "—",
                          f"{_duration(elapsed)} / {_duration(eta) if eta is not None else '—'}",
                          f"{value(cpu_rss_key)} / {value(cpu_peak_key)} GiB",
                          f"{value('perf/gpu_allocated_gib')} / {value('perf/gpu_reserved_gib')} GiB")
+        stability = Table(title="Training stability", expand=True)
+        for title in ("LR / phase", "Gradient before / after", "Clip coefficient / fraction", "Pressure / Force PPL", "AMP skips"):
+            stability.add_column(title)
+        stability.add_row(f"{value('train/learning_rate')} / {m.get('train/scheduler_phase', '—')}",
+                          f"{value('train/gradient_norm_before_clipping')} / {value('train/gradient_norm_after_clipping')}",
+                          f"{value('train/gradient_clipping_coefficient')} / {value('train/gradient_clipping_fraction')}",
+                          f"{value('train/pressure_codebook_perplexity')} / {value('train/force_codebook_perplexity')}",
+                          value('train/amp_skipped_update_count'))
         pipeline = Table(title="Data pipeline", expand=True)
         pipeline.add_column("Wait ratio / ms per batch")
         pipeline.add_column("Parquet / video ms per call")
@@ -154,12 +166,15 @@ class Monitor:
                          f"{value('perf/parquet_read_ms')} / {value('perf/video_decode_ms')}",
                          f"{value('perf/parquet_cache_hit_rate')} / {value('perf/video_cache_hit_rate')}")
         notes = Table(title="Current activity / recent messages", expand=True, show_header=False)
+        notes.add_row(f"Metrics: {self.metrics_path}")
+        if not self.metrics_path.is_file():
+            notes.add_row("Metrics file not created yet; check the path if training is already running.")
         current = next((self.stages[n] for n in reversed(STAGES)
                         if self.stages.get(n, {}).get("status") == "Running"), {})
         notes.add_row(current.get("detail") or self.phase)
         for line in self.recent:
             notes.add_row(line[-160:])
-        return Group(table, training, pipeline, notes)
+        return Group(table, training, stability, pipeline, notes)
 
     def _event(self, line: str) -> bool:
         if not line.startswith(PREFIX):
@@ -239,17 +254,18 @@ class Monitor:
                 self.metrics["step"] = max(int(record["step"]), self.metrics.get("step", 0))
             self.metrics.update({key: value for key, value in record.items()
                                  if key.startswith(("train/", "val/", "alignment/", "perf/"))
-                                 and isinstance(value, (int, float))})
+                                 and (isinstance(value, (int, float)) or key == 'train/scheduler_phase')})
             if record.get("record_type") == "performance_event":
                 for key, value in record.items():
                     if key.startswith("perf/") and key.endswith("_seconds"):
                         summary = f"{key[5:-8]} completed at step {record.get('step', '?')} in {value:.1f}s"
                         self.recent.append(summary)
-                        if not self.tty:
+                        if not self.tty and self._metrics_initialized:
                             print(summary, flush=True)
             if "seconds" in record:
                 self.metrics["seconds"] = record["seconds"]
         self.metrics_offset = self._read_file(self.metrics_path, self.metrics_offset, on_metric)
+        self._metrics_initialized = True
 
     def refresh(self, live: Live | None, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -261,7 +277,60 @@ class Monitor:
             self.last_refresh = now
 
 
+def validate_monitor_paths(command: list[str], metrics_path: Path) -> None:
+    """Fail before spawning training when shell expansion lost the run directory."""
+    if metrics_path.resolve().parent == Path("/"):
+        raise ValueError("--metrics points to the filesystem root; check the run directory shell variable")
+    for index, token in enumerate(command):
+        if Path(token).name != "trainctl" or command[index+1:index+2] != ["run"]:
+            continue
+        options = command[index+2:]
+        if "--" in options:
+            options = options[:options.index("--")]
+        for position, option in enumerate(options):
+            if option == "--checkpoint-dir":
+                directory = options[position+1] if position+1 < len(options) else ""
+            elif option.startswith("--checkpoint-dir="):
+                directory = option.split("=", 1)[1]
+            else:
+                continue
+            if not directory.strip() or directory.startswith("--"):
+                raise ValueError("trainctl --checkpoint-dir is empty; set the run directory before launching")
+            expected = Path(directory).expanduser().resolve() / "metrics.jsonl"
+            if metrics_path.expanduser().resolve() != expected:
+                raise ValueError(f"--metrics must match trainctl --checkpoint-dir: {expected}")
+
+
+def watch_metrics(metrics_path: Path, total_steps: int, *, log_path: Path | None = None,
+                  once: bool = False) -> int:
+    """Read an existing run without starting or controlling any training process."""
+    if not metrics_path.is_file():
+        raise ValueError(f"Existing metrics file required for --watch: {metrics_path}")
+    if log_path is not None and not log_path.is_file():
+        raise ValueError(f"Existing log file required for --log: {log_path}")
+    monitor = Monitor(metrics_path, total_steps)
+    monitor.log_path = log_path
+    monitor.phase = "Watching metrics"
+    monitor.poll()
+    if int(monitor.metrics.get("step", 0)) >= total_steps:
+        monitor.phase = "Completed"
+    if once:
+        monitor.console.print(monitor._render())
+        return 0
+    try:
+        with Live(monitor._render(), console=monitor.console, auto_refresh=False) as live:
+            while True:
+                monitor.poll()
+                if int(monitor.metrics.get("step", 0)) >= total_steps:
+                    monitor.phase = "Completed"
+                monitor.refresh(live)
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+
+
 def run_monitor(command: list[str], metrics_path: Path, total_steps: int, *, tty: bool | None = None) -> int:
+    validate_monitor_paths(command, metrics_path)
     monitor = Monitor(metrics_path, total_steps, tty=tty)
     env = os.environ.copy()
     env["TAF_TERMINAL_MONITOR"] = "1"
@@ -336,12 +405,26 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--total-steps", type=int, required=True)
+    parser.add_argument("--watch", action="store_true", help="Only view an existing run; never start or stop training")
+    parser.add_argument("--once", action="store_true", help="With --watch, print one dashboard snapshot and exit")
+    parser.add_argument("--log", type=Path, help="With --watch, read this existing training log")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command:
+    if args.total_steps < 1:
+        parser.error("--total-steps must be positive")
+    if args.watch and command:
+        parser.error("--watch cannot start a command")
+    if not args.watch and (args.once or args.log):
+        parser.error("--once and --log require --watch")
+    if not args.watch and not command:
         parser.error("trainctl command required after --")
-    return run_monitor(command, args.metrics, args.total_steps)
+    try:
+        if args.watch:
+            return watch_metrics(args.metrics, args.total_steps, log_path=args.log, once=args.once)
+        return run_monitor(command, args.metrics, args.total_steps)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

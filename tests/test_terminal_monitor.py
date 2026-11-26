@@ -1,6 +1,8 @@
 """Synthetic trainctl log relay tests; no dataset or GPU is used."""
 
 import json
+import contextlib
+import io
 import os
 import pty
 import select
@@ -11,8 +13,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from script.terminal_monitor import Monitor, run_monitor
+from script.terminal_monitor import Monitor, run_monitor, validate_monitor_paths, watch_metrics
 from utils.live_progress import PREFIX
 
 
@@ -20,6 +23,52 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TerminalMonitorTests(unittest.TestCase):
+    def test_existing_metrics_are_loaded_and_continue_updating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics.jsonl"
+            metrics.write_text(json.dumps({"step": 2620, "seconds": 4253.6, "train/loss_total": 14.0}) + "\n")
+            monitor = Monitor(metrics, 10000, tty=False)
+            monitor.poll()
+            self.assertEqual(monitor.metrics["step"], 2620)
+            self.assertEqual(monitor.metrics["seconds"], 4253.6)
+            with metrics.open("a") as stream:
+                stream.write(json.dumps({"step": 2640, "train/loss_total": 13.0}) + "\n")
+            monitor.poll()
+            self.assertEqual(monitor.metrics["step"], 2640)
+            self.assertEqual(monitor.metrics["train/loss_total"], 13.0)
+
+    def test_bad_paths_fail_before_starting_any_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics.jsonl"
+            for path, checkpoint_dir in ((Path("/metrics.jsonl"), ""), (metrics, ""), (metrics, directory + "/wrong")):
+                with self.subTest(path=path, checkpoint_dir=checkpoint_dir), \
+                        patch("script.terminal_monitor.subprocess.Popen") as launch:
+                    with self.assertRaises(ValueError):
+                        run_monitor(["uv", "run", "trainctl", "run", "--checkpoint-dir", checkpoint_dir,
+                                     "--", "python", "fake.py"], path, 10000)
+                    launch.assert_not_called()
+            validate_monitor_paths(["uv", "run", "trainctl", "run", "--checkpoint-dir", directory,
+                                    "--", "python", "fake.py"], metrics)
+            validate_monitor_paths(["trainctl", "run", f"--checkpoint-dir={directory}", "--", "fake"], metrics)
+
+    def test_watch_snapshot_never_starts_or_stops_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = Path(directory) / "metrics.jsonl"
+            metrics.write_text(json.dumps({"step": 10000, "train/loss_total": 1.5}) + "\n" +
+                               json.dumps({"step": 10000, "record_type": "performance_event",
+                                           "perf/validation_seconds": 42.0}) + "\n")
+            with contextlib.redirect_stdout(io.StringIO()) as output, \
+                    patch("script.terminal_monitor.subprocess.Popen") as launch, \
+                    patch("script.terminal_monitor._stop_tree") as stop:
+                self.assertEqual(watch_metrics(metrics, 10000, once=True), 0)
+                launch.assert_not_called(); stop.assert_not_called()
+            self.assertIn("Completed", output.getvalue())
+            # Historical events may appear inside the dashboard's recent rows,
+            # but must not be printed as a stream before the dashboard itself.
+            self.assertTrue(output.getvalue().lstrip().startswith("TaFVLA"))
+            with self.assertRaisesRegex(ValueError, "Existing metrics"):
+                watch_metrics(metrics.with_name("missing.jsonl"), 10000, once=True)
+
     def test_plain_relay_and_run_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

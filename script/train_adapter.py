@@ -55,6 +55,8 @@ from utils.frame_cache import CachedWindowDataset, FrozenFrameCache
 from utils.performance import PerformanceMonitor
 from utils.pipeline import PipelineDataset, PipelineCollate
 from utils.model_factory import build_model
+from utils.codebook_init import initialize_codebooks
+from utils.optimization import UpdateLRScheduler, gradient_metrics, optimizer_update
 from utils.trainctl import (
     TrainctlReporter,
     ValidationHistory,
@@ -357,7 +359,19 @@ def run_training(cfg: DictConfig) -> None:
         step, epoch = int(checkpoint["step"]), int(checkpoint.get("epoch", 0))
         restore_rng(checkpoint)
         print(f"Resumed {resume_path} at optimizer step {step}")
+    scheduler = UpdateLRScheduler(optimizer, train_cfg.get("scheduler"),
+                                  int(train_cfg.max_steps), float(train_cfg.learning_rate))
+    if checkpoint is not None:
+        scheduler.restore(checkpoint.get("scheduler"), step)
     progress_event("Model / Optimizer Initialization", "Completed")
+    stability_state = dict(checkpoint.get("stability", {})) if checkpoint is not None else {}
+    initialization = initialize_codebooks(model, dataset, train_indices, cfg.vq,
+                                          resume=checkpoint is not None)
+    if initialization is not None:
+        stability_state["initialization"] = initialization
+    skipped_updates = int(stability_state.get("amp_skipped_updates", 0))
+    clipped_updates = torch.tensor(int(stability_state.get("clipped_updates", 0)), device=device)
+    monitored_updates = int(stability_state.get("monitored_updates", step if "clipped_updates" in stability_state else 0))
 
     cached_dataset = dataset
     frame_cache = None
@@ -511,6 +525,8 @@ def run_training(cfg: DictConfig) -> None:
         cfg.wandb,
         checkpoint.get("wandb") if checkpoint is not None else None,
     )
+    if initialization is not None:
+        logger.write({"record_type": "codebook_initialization", "global_step": 0, **initialization})
     if comparison:
         logger.write({"record_type": "comparison", **comparison_identity,
                       "sampling": batch_sampler.report.as_dict(),
@@ -522,6 +538,20 @@ def run_training(cfg: DictConfig) -> None:
     finally:
         # Experiment tracking must not change training randomness.
         restore_rng_state(rng_before_wandb)
+    if initialization is not None:
+        init_metrics = {f"initialization/{key}": initialization[key]
+                        for key in ("sample_count", "episode_count", "sequence_count", "elapsed_seconds")}
+        for branch in ("pressure", "force"):
+            for key, value in initialization[branch].items():
+                if isinstance(value, (int, float)):
+                    init_metrics[f"initialization/{branch}/{key}"] = value
+            if logger.run is not None:
+                import wandb
+                init_metrics[f"initialization/{branch}/cluster_occupancy"] = wandb.Histogram(
+                    initialization[branch]["cluster_occupancy"])
+        logger.log_wandb(init_metrics, 0, allow_same_step=True)
+        if logger.run is not None:
+            logger.run.summary["codebook_initialization"] = initialization
 
     backbone_metadata = model.tactile_encoder.checkpoint_identity()
     backbone_metadata.update(
@@ -572,6 +602,10 @@ def run_training(cfg: DictConfig) -> None:
         ),
         "optimizer": "AdamW",
         "learning_rate": float(train_cfg.learning_rate),
+        "codebook_initialization": cfg.vq.get("initialization", "uniform"),
+        "scheduler_type": scheduler.spec["type"],
+        "warmup_steps": scheduler.spec.get("warmup_steps", 0),
+        "minimum_lr": scheduler.spec.get("min_lr", float(train_cfg.learning_rate)),
         "initial_step": step,
         "total_steps": max_steps,
         "validate_every": int(train_cfg.validate_every),
@@ -653,6 +687,10 @@ def run_training(cfg: DictConfig) -> None:
         perf.phase(False)
         begin = time.perf_counter()
         try:
+            kwargs["scheduler_state"] = scheduler.state_dict()
+            kwargs["stability_state"] = {**stability_state, "amp_skipped_updates": skipped_updates,
+                                          "clipped_updates": int(clipped_updates),
+                                          "monitored_updates": monitored_updates}
             save_checkpoint(*args, **kwargs)
         except BaseException:
             perf.phase(True)
@@ -792,14 +830,30 @@ def run_training(cfg: DictConfig) -> None:
 
                 with perf.stage("optimizer"):
                     scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        (parameter for parameter in model.parameters() if parameter.requires_grad),
-                        float(train_cfg.grad_clip_norm),
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
+                    diagnostics_due = ((step + 1) % int(train_cfg.log_every) == 0
+                                       or (cfg.wandb.enabled and (step + 1) % int(cfg.wandb.log_every) == 0)
+                                       or (step + 1) % int(train_cfg.save_every) == 0
+                                       or step + 1 == max_steps)
+                    gradients = gradient_metrics(model, float(train_cfg.grad_clip_norm),
+                                                  module_norms=diagnostics_due)
+                    grad_norm = gradients["train/gradient_norm"]
+                    learning_rate = float(optimizer.param_groups[0]["lr"])
+                    phase = scheduler.phase(step + 1)
+                    updated = optimizer_update(optimizer, scaler, scheduler)
                     optimizer.zero_grad(set_to_none=True)
+                if not updated:
+                    skipped_updates += 1
+                    skipped_record = {"record_type": "amp_skipped_update", "step": step,
+                                      "train/amp_skipped_update_count": skipped_updates,
+                                      "train/scheduler_step": scheduler.completed_updates,
+                                      "train/learning_rate": learning_rate}
+                    logger.write(skipped_record)
+                    logger.log_wandb({k: v for k, v in skipped_record.items() if k.startswith("train/")},
+                                     step, allow_same_step=True)
+                    continue
                 step += 1
+                monitored_updates += 1
+                clipped_updates += (grad_norm > float(train_cfg.grad_clip_norm)).long()
                 if perf.enabled:
                     perf.record_iteration(time.perf_counter() - iteration_start,
                                           int(force.shape[0]), int(force.shape[0] * force.shape[1]))
@@ -807,10 +861,13 @@ def run_training(cfg: DictConfig) -> None:
                 # Micro-step이 아니라 실제 optimizer.step()과 1:1로 진행한다.
                 logger.advance(step)
                 elapsed = time.time() - started
-                learning_rate = float(optimizer.param_groups[0]["lr"])
                 optimization = {
+                    **gradients,
                     "train/learning_rate": learning_rate,
-                    "train/gradient_norm": grad_norm.detach(),
+                    "train/scheduler_step": scheduler.completed_updates,
+                    "train/scheduler_phase": phase,
+                    "train/gradient_clipping_fraction": clipped_updates.float() / monitored_updates,
+                    "train/amp_skipped_update_count": skipped_updates,
                     "global_step": step,
                     "epoch": epoch,
                     "train/elapsed_time_seconds": elapsed,
@@ -818,8 +875,10 @@ def run_training(cfg: DictConfig) -> None:
                 last_optimization = dict(optimization)
 
                 def logged_optimization() -> dict[str, Any]:
-                    return {**optimization,
-                            "train/gradient_norm": float(optimization["train/gradient_norm"])}
+                    keys = list(gradients)
+                    values = torch.stack([gradients[key] for key in keys]).detach().cpu().tolist()
+                    return {**optimization, **dict(zip(keys, values, strict=True)),
+                            "train/gradient_clipping_fraction": float(clipped_updates) / monitored_updates}
 
                 if step % int(train_cfg.log_every) == 0:
                     local_record: dict[str, Any] = {
@@ -829,6 +888,8 @@ def run_training(cfg: DictConfig) -> None:
                         "learning_rate": learning_rate,
                         "grad_norm": float(grad_norm),
                         **local_rolling.pop_means("train"),
+                        **logged_optimization(),
+                        "scheduler_step": scheduler.completed_updates,
                     }
                     logger.write(local_record)
                     logger.update_training(local_record)

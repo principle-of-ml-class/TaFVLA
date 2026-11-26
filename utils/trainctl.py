@@ -129,6 +129,9 @@ def build_start_message(info: Mapping[str, Any]) -> str:
         f"Stride: {info['stride']} | Batch: {info['batch_size']} × accumulation {info['accumulation']} "
         f"= effective {info['effective_batch_size']}",
         f"Optimizer: {info['optimizer']} | LR: {info['learning_rate']:.6g}",
+        f"Codebook initialization: {info.get('codebook_initialization', 'uniform')} | "
+        f"Scheduler: {info.get('scheduler_type', 'constant')} | warmup steps: {info.get('warmup_steps', 0)} | "
+        f"peak LR: {info['learning_rate']:.6g} | minimum LR: {info.get('minimum_lr', info['learning_rate']):.6g}",
         f"Steps: {info['initial_step']} → {info['total_steps']} | validation every {info['validate_every']} "
         f"| checkpoint every {info['save_every']}",
         f"Dataset: train {info['train_windows']} windows/{info['train_groups']} groups | "

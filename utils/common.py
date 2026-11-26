@@ -30,7 +30,8 @@ _CONFIG_KEYS = {
     "force_encoder": {
         "hidden_dim", "pressure_latent_dim", "force_latent_dim", "mlp_layers",
     },
-    "vq": {"pressure_codebook_size", "force_codebook_size", "commitment_beta"},
+    "vq": {"pressure_codebook_size", "force_codebook_size", "commitment_beta",
+           "initialization", "kmeans_samples", "kmeans_iters", "kmeans_seed"},
     "tactile_encoder": {
         "backbone", "pretrained", "freeze_backbone", "transformer_dim",
         "transformer_layers", "num_heads", "dropout", "max_window_size", "backbone_chunk_frames",
@@ -41,7 +42,7 @@ _CONFIG_KEYS = {
         "batch_size", "gradient_accumulation_steps", "learning_rate", "weight_decay",
         "max_steps", "num_workers", "eval_num_workers", "prefetch_factor", "seed", "amp", "grad_clip_norm", "log_every",
         "validate_every", "validation_batches", "save_every", "output_dir", "resume",
-        "min_same_episode_window_gap", "batch_sampler",
+        "min_same_episode_window_gap", "batch_sampler", "scheduler",
     },
     "wandb": {
         "enabled", "project", "entity", "name", "group", "tags", "mode",
@@ -290,6 +291,19 @@ def validate_config(config: DictConfig, *, require_data_root: bool = False) -> N
         raise ValueError("loss.nce_mode must be 'paper' or 'symmetric'")
 
     training = sections["training"]
+    vq = sections["vq"]
+    if vq.get("initialization", "uniform") not in {"uniform", "kmeans"}:
+        raise ValueError("vq.initialization must be 'uniform' or 'kmeans'")
+    for key, minimum in (("kmeans_samples", 1), ("kmeans_iters", 1), ("kmeans_seed", 0)):
+        _integer(vq.get(key, {"kmeans_samples": 16384, "kmeans_iters": 20, "kmeans_seed": 42}[key]),
+                 f"vq.{key}", minimum=minimum)
+    if vq.get("initialization", "uniform") == "kmeans" and vq.kmeans_samples < max(
+            vq.pressure_codebook_size, vq.force_codebook_size):
+        raise ValueError("vq.kmeans_samples must be >= both codebook sizes")
+    scheduler = training.get("scheduler")
+    if scheduler is not None:
+        from utils.optimization import UpdateLRScheduler
+        UpdateLRScheduler.validate_options(scheduler, float(training.learning_rate), int(training.max_steps))
     if training.get("batch_sampler", "auto") not in {"auto", "epoch_shuffled"}:
         raise ValueError("training.batch_sampler must be 'auto' or 'epoch_shuffled'")
     _integer(training.batch_size, "training.batch_size", minimum=2)
