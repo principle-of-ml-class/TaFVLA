@@ -12,7 +12,7 @@ comparison:
   manifest: metadata/episode_split/manifest.parquet
 
 training:
-  max_steps: 10000
+  max_steps: 40000
   resume: null
   output_dir: outputs/comparison/sparsh_episode_runs
 

@@ -27,7 +27,7 @@ class PhaseConfig:
     noise_multiplier: float = 3.
     min_run_frames: int = 2
     baseline_pressure_quantile: float = .1
-    timestamp_relative_tolerance: float = .1
+    timestamp_relative_tolerance: float = .1  # Audit threshold only; irregular intervals are supported.
 
     def __post_init__(self):
         if self.range_fraction <= 0 or self.noise_multiplier <= 0 or self.min_run_frames != 2:
@@ -40,17 +40,31 @@ class PhaseConfig:
         return identity({"version": VERSION, "source_sha256": SOURCE_SHA256, **asdict(self), "windows_seconds": [.2, .3], "smoothing": "none"})
 
 
+def _timestamp_diagnostics(t, config: PhaseConfig):
+    """Validate time ordering, but only audit interval variation (upstream uses median dt)."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        dt = np.diff(t)
+    if not np.isfinite(dt).all() or np.any(dt <= 0):
+        raise ValueError("Episode timestamps must have finite, strictly increasing sampling intervals")
+    median = float(np.median(dt)) if len(dt) else None
+    if median is not None and (not np.isfinite(median) or median <= 0):
+        raise ValueError("Invalid median sampling interval")
+    deviation = float(np.max(np.abs(dt-median))/median) if len(dt) else None
+    return {"median_dt": median, "min_dt": float(dt.min()) if len(dt) else None,
+            "max_dt": float(dt.max()) if len(dt) else None,
+            "max_relative_deviation": deviation,
+            "timestamp_relative_tolerance": config.timestamp_relative_tolerance,
+            "exceeds_relative_tolerance": bool(deviation is not None and deviation > config.timestamp_relative_tolerance),
+            "interval_policy": "episode_median_dt", "tolerance_role": "diagnostic_only"}
+
+
 def validate_signals(timestamps, force, pressure, config: PhaseConfig):
     t, f, p = (np.asarray(v, dtype=np.float64) for v in (timestamps, force, pressure))
     if t.ndim != 1 or len(t) < 1 or f.shape != (len(t), 6) or p.shape != (len(t), 12, 12):
         raise ValueError("Episode arrays must be timestamps[F], force[F,6], pressure[F,12,12]")
     if not all(np.isfinite(v).all() for v in (t, f, p)):
         raise ValueError("Non-finite episode timestamp/force/pressure")
-    dt = np.diff(t)
-    if np.any(dt <= 0):
-        raise ValueError("Episode timestamps must be strictly increasing")
-    if len(dt) and np.max(np.abs(dt-np.median(dt))) > config.timestamp_relative_tolerance*np.median(dt):
-        raise ValueError("Irregular timestamps exceed fixed-window regression tolerance")
+    _timestamp_diagnostics(t, config)
     return t, f, p
 
 
@@ -66,7 +80,8 @@ def episode_preprocess(timestamps, force, pressure, config: PhaseConfig = PhaseC
     baseline = float(np.median(signed[mask]))
     return signed-baseline, {"applied_sign": sign, "episode_baseline": baseline,
                              "baseline_mode": "low_pressure", "baseline_pressure_quantile": config.baseline_pressure_quantile,
-                             "offline_episode_wide": True, "smoothing": "none"}
+                             "offline_episode_wide": True, "smoothing": "none",
+                             "timestamp_diagnostics": _timestamp_diagnostics(t, config)}
 
 
 def fit_sensor_calibration(episodes, config: PhaseConfig = PhaseConfig()):
@@ -95,17 +110,18 @@ def classify_window(timestamps, signed_force, seconds: float, calibration: dict,
     t = np.asarray(timestamps, dtype=np.float64); f = np.asarray(signed_force, dtype=np.float64)
     if t.ndim != 1 or f.shape != t.shape or not len(t) or not np.isfinite(t).all() or not np.isfinite(f).all():
         raise ValueError("Invalid classification arrays")
-    dt_values = np.diff(t)
-    if len(dt_values) and (np.any(dt_values <= 0) or np.max(np.abs(dt_values-np.median(dt_values))) > config.timestamp_relative_tolerance*np.median(dt_values)):
-        raise ValueError("Invalid classification timestamps")
+    timing = _timestamp_diagnostics(t, config)
     if calibration["configuration_id"] != config.configuration_id:
         raise ValueError("Stale calibration configuration")
-    dt = float(np.median(dt_values)) if len(dt_values) else None
+    dt = timing["median_dt"]
     labels = np.full(len(f), "unknown", dtype=object)
     slope = np.full(len(f), np.nan); change = slope.copy()
     valid = np.zeros(len(f), dtype=bool)
     if dt is None:
-        return labels, slope, change, valid, {"requested_seconds": seconds, "reason": "insufficient_timestamps", "points": None}
+        return labels, slope, change, valid, {"requested_seconds": seconds, "reason": "insufficient_timestamps", "points": None,
+                                              "nominal_span_seconds": None, "actual_span_seconds_min": None,
+                                              "actual_span_seconds_median": None, "actual_span_seconds_max": None,
+                                              **timing}
     intervals = int(round(seconds/dt)); points = intervals+1
     if intervals < 1:
         raise ValueError("Sampling interval is too long for classifier windows")
@@ -115,12 +131,17 @@ def classify_window(timestamps, signed_force, seconds: float, calibration: dict,
     noise = calibration["noise_sigma"]
     change_thr = max(config.noise_multiplier*np.sqrt(2)*noise, floor)
     slope_thr = max(config.noise_multiplier*noise/np.sqrt(x@x), floor/duration)
-    details = dict(requested_seconds=seconds, points=points, actual_span_seconds=duration,
-                   median_dt=dt, min_dt=float(dt_values.min()), max_dt=float(dt_values.max()),
+    details = dict(requested_seconds=seconds, points=points, nominal_span_seconds=duration,
+                   actual_span_seconds_min=None, actual_span_seconds_median=None, actual_span_seconds_max=None,
+                   **timing,
                    left_frames=left, right_frames=right, center_offset_seconds=(right-left)*dt/2,
                    change_threshold=change_thr, slope_threshold=slope_thr,
                    reason="short_episode" if len(f) < points else "boundary_support_unavailable")
     if len(f) >= points:
+        actual_spans = t[intervals:]-t[:-intervals]
+        details.update(actual_span_seconds_min=float(actual_spans.min()),
+                       actual_span_seconds_median=float(np.median(actual_spans)),
+                       actual_span_seconds_max=float(actual_spans.max()))
         windows = np.lib.stride_tricks.sliding_window_view(f, points)
         inner_slope = windows@x/(x@x); inner_change = windows[:, -1]-windows[:, 0]
         inner = np.full(len(windows), "unknown", object)

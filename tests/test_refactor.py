@@ -262,6 +262,28 @@ class RefactorSmokeTests(unittest.TestCase):
         for key in ("z_tactile", "c_force", "loss_total", "loss_quant", "loss_recon"):
             self.assertTrue(torch.equal(current_output[key], legacy_output[key]), key)
 
+    def test_wandb_tag_failure_reports_actual_cause_without_login_hint(self) -> None:
+        from wandb import Settings
+
+        config = compose_config("wandb.enabled=true", "wandb.mode=online")
+        config.wandb.tags = ["phase4-experiment:" + "a"*64]
+
+        def validate_without_remote_run(**kwargs):
+            Settings(run_tags=tuple(kwargs["tags"]))
+            raise AssertionError("The oversized tag should fail local validation")
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, {"wandb": SimpleNamespace(init=validate_without_remote_run)},
+        ):
+            logger = ExperimentLogger(Path(directory), config.wandb)
+            with self.assertRaises(RuntimeError) as caught:
+                logger.start(config, torch.nn.Linear(1, 1))
+            self.assertIn("ValidationError", str(caught.exception))
+            self.assertIn("64 characters", str(caught.exception))
+            self.assertNotIn("wandb login", str(caught.exception))
+            self.assertIsNotNone(caught.exception.__cause__)
+            self.assertIsNone(logger.run)
+
     def test_disabled_logger_keeps_jsonl(self) -> None:
         config = compose_config("wandb.enabled=false")
         console = io.StringIO()

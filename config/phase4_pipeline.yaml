@@ -1,15 +1,15 @@
-# Standalone pipeline schema. No K-means/scheduler options are changed here.
+# Standalone pipeline schema. Stable training enables existing K-means++ and warmup/cosine options.
 data_root: /ssdg/spl_yeongyoo/taf_dataset
-sensors: [custom_6x6_markers]
+sensors: [gs_mini_with_markers]
 timestamp_cache_dir: null
 sensor_mmap_dir: outputs/sensor_mmap
-split_reference: auto
+split_reference: null
 split_seed: 42
 validation_fraction: 0.16778096628471026
 test_fraction: 0.1
-prepared_dir: metadata/phase4/v1
-results_dir: outputs/phase4/v1
-training_config: taf_adapter_sparsh_episode
+prepared_dir: metadata/phase4/gs_mini
+results_dir: outputs/phase4/gs_mini
+training_config: taf_adapter_sparsh_episode_stable
 windows: [1, 3, 5, 7, 10, 20]
 seed: 42
 eval_batch_size: 16
@@ -22,4 +22,4 @@ classifier:
   noise_multiplier: 3.0
   min_run_frames: 2
   baseline_pressure_quantile: 0.1
-  timestamp_relative_tolerance: 0.1
+  timestamp_relative_tolerance: 0.1  # 진단용 편차 기준. 초과해도 median dt로 분류하며 중단하지 않음.

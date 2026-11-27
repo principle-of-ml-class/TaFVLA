@@ -25,6 +25,7 @@ from utils.dynamics import ManifestDataset
 from utils.endpoint_eval import MetricSums, RidgeStatistics, endpoint_error, evaluate_endpoints, ridge_predict
 from utils.phase_routing import aggregate_and_route, select_policy
 from tests.test_dynamics_comparison import FakeSource
+from tests.phase4_reference import classify as reference_classify, fuse as reference_fuse
 
 
 class TinyTactile(torch.nn.Module):
@@ -106,11 +107,80 @@ class ClassifierTests(unittest.TestCase):
                 self.assertTrue((~result[3][:left]).all()); self.assertTrue((~result[3][-right:]).all())
 
     def test_fusion_all_16_cases_and_symmetry(self):
+        upstream_names = dict(zip(PHASES, ("Loading", "Holding", "Unloading", "Transition / Unknown")))
         for a, b in itertools.product(PHASES, repeat=2):
             expected = "unknown" if {a,b} == {"loading","unloading"} else "loading" if "loading" in (a,b) else "unloading" if "unloading" in (a,b) else "holding" if a == b == "holding" else "unknown"
             fused, conflict = fuse_phases([a], [b]); other, reverse = fuse_phases([b], [a])
             self.assertEqual(fused[0], expected); self.assertEqual(fused[0], other[0]); self.assertEqual(conflict[0], reverse[0])
             self.assertEqual(conflict[0], {a,b} == {"loading","unloading"})
+            upstream, upstream_conflict = reference_fuse(np.array([upstream_names[a]]), np.array([upstream_names[b]]))
+            self.assertEqual(upstream_names[fused[0]], upstream[0])
+            np.testing.assert_array_equal(conflict, upstream_conflict)
+
+    def test_regular_and_irregular_timestamps_match_pinned_upstream(self):
+        calibration, cfg = self.calibration()
+        upstream_cfg = {**calibration, "range_fraction": cfg.range_fraction, "min_run_frames": cfg.min_run_frames}
+        names = {"Loading":"loading", "Holding":"holding", "Unloading":"unloading", "Transition / Unknown":"unknown"}
+        rng = np.random.default_rng(42)
+        for fps in (15, 30, 60):
+            regular = np.arange(180)/fps
+            jitter = np.r_[0, np.cumsum((1+.35*np.sin(np.arange(179)*1.3))/fps)]
+            dropped = regular.copy(); dropped[90:] += 2
+            signals = (20*regular, -20*regular, np.zeros(180),
+                       np.r_[np.arange(60), np.full(60,59), np.arange(59,-1,-1)],
+                       rng.normal(size=180))
+            for kind, t in (("regular",regular), ("jitter",jitter), ("dropped_frames",dropped)):
+                for number, force in enumerate(signals):
+                    with self.subTest(fps=fps, timestamps=kind, signal=number):
+                        actual, reference = [], []
+                        for seconds in (.2, .3):
+                            result = classify_window(t,force,seconds,calibration,cfg)
+                            expected, details = reference_classify(t,force,seconds,upstream_cfg)
+                            np.testing.assert_array_equal(result[0], [names[label] for label in expected])
+                            # The upstream key describes intervals * median dt, not measured timestamp spans.
+                            self.assertEqual(result[4]["nominal_span_seconds"],details["actual_span_seconds"])
+                            for key in ("points","left_frames","right_frames","slope_threshold","change_threshold"):
+                                self.assertEqual(result[4][key],details[key])
+                            actual.append(result[0]); reference.append(expected)
+                        fused, conflict = fuse_phases(*actual)
+                        expected, expected_conflict = reference_fuse(*reference)
+                        np.testing.assert_array_equal(fused,[names[label] for label in expected])
+                        np.testing.assert_array_equal(conflict,expected_conflict)
+
+    def test_irregular_audit_distinguishes_nominal_and_measured_spans(self):
+        calibration, cfg = self.calibration()
+        t = np.arange(60)/30; t[30:] += 1
+        force = np.zeros((60,6)); force[:,2] = np.arange(60)
+        pressure = np.ones((60,12,12))
+        result, audit = classify_episode(t,force,pressure,calibration,cfg)
+        timing = audit["timestamp_diagnostics"]; dt = np.diff(t); median = np.median(dt)
+        self.assertTrue(timing["exceeds_relative_tolerance"])
+        self.assertEqual(timing["tolerance_role"],"diagnostic_only")
+        self.assertEqual(timing["median_dt"],median)
+        self.assertEqual(timing["min_dt"],dt.min()); self.assertEqual(timing["max_dt"],dt.max())
+        self.assertEqual(timing["max_relative_deviation"],float(max(abs(dt-median))/median))
+        for suffix in ("02","03"):
+            window = audit[f"window_{suffix}"]; mask = result[f"supported_{suffix}"]
+            spans = t[result[f"window_end_{suffix}"][mask]]-t[result[f"window_start_{suffix}"][mask]]
+            np.testing.assert_array_equal(result[f"actual_span_{suffix}"][mask],spans)
+            self.assertEqual(window["nominal_span_seconds"],(window["points"]-1)*median)
+            self.assertEqual(window["actual_span_seconds_min"],float(spans.min()))
+            self.assertEqual(window["actual_span_seconds_median"],float(np.median(spans)))
+            self.assertEqual(window["actual_span_seconds_max"],float(spans.max()))
+            self.assertGreater(spans.max(),window["nominal_span_seconds"]+.9)
+            # A missing-frame gap is diagnostic, never an additional Unknown mask.
+            self.assertTrue((result[f"phase_{suffix}"][mask] == "loading").all())
+        json.dumps(audit,allow_nan=False)
+
+    def test_irregular_train_episodes_are_included_in_calibration(self):
+        cfg = PhaseConfig(); t = np.arange(60)/30
+        force = np.zeros((60,6)); force[:,2] = np.sin(np.arange(60)) + np.arange(60)
+        pressure = np.ones((60,12,12))
+        irregular = t.copy(); irregular[30:] += 2
+        uniform = fit_sensor_calibration([("train",t,force,pressure)]*2,cfg)
+        actual = fit_sensor_calibration([("train",t,force,pressure),("train",irregular,force,pressure)],cfg)
+        self.assertEqual(actual,uniform)
+        self.assertEqual(actual["train_episodes"],2); self.assertEqual(actual["train_frames"],120)
 
     def test_invalid_data_is_not_unknown_and_short_support_is_explicit(self):
         calibration, cfg = self.calibration()
@@ -119,13 +189,39 @@ class ClassifierTests(unittest.TestCase):
             result, audit = classify_episode(t, f, p, calibration, cfg)
             self.assertTrue((result["phase"] == "unknown").all())
             self.assertFalse(result["supported_02"].any())
+            self.assertFalse(result["supported_03"].any())
+            self.assertIsNone(audit["window_02"]["actual_span_seconds_max"])
+            json.dumps(audit,allow_nan=False)
         t = np.arange(20)/30; f = np.ones((20,6)); p = np.ones((20,12,12))
-        for bad in (t[::-1], np.r_[t[:10], t[9], t[11:]], np.r_[t[:10], np.nan, t[11:]], np.arange(20)**2/30):
+        for bad in (t[::-1], np.r_[t[:10], t[9], t[11:]],
+                    *[np.r_[t[:10], value, t[11:]] for value in (np.nan,np.inf,-np.inf)]):
             with self.assertRaises(ValueError):
                 classify_episode(bad, f, p, calibration, cfg)
-        f[2,2] = np.nan
+            with self.assertRaises(ValueError):
+                classify_window(bad,f[:,2],.2,calibration,cfg)
+            with self.assertRaises(ValueError):
+                fit_sensor_calibration([("train",bad,f,p)],cfg)
+        for value in (np.nan,np.inf,-np.inf):
+            for array in (f,p):
+                invalid = array.copy(); invalid.flat[2] = value
+                with self.assertRaises(ValueError):
+                    classify_episode(t,invalid if array is f else f,invalid if array is p else p,calibration,cfg)
+            bad_signal = f[:,2].copy(); bad_signal[2] = value
+            with self.assertRaises(ValueError):
+                classify_window(t,bad_signal,.2,calibration,cfg)
+        for bad_t,bad_f,bad_p in ((t[:0],f[:0],p[:0]),(t[:,None],f,p),(t,f[:,:5],p),(t,f,p[:,:,:11])):
+            with self.assertRaises(ValueError):
+                classify_episode(bad_t,bad_f,bad_p,calibration,cfg)
+        with self.assertRaisesRegex(ValueError,"Sampling interval"):
+            classify_window(np.arange(20),f[:,2],.2,calibration,cfg)
+        with self.assertRaisesRegex(ValueError,"sampling intervals"):
+            classify_episode([-np.finfo(float).max,np.finfo(float).max],f[:2],p[:2],calibration,cfg)
+
+    def test_calibration_identity_remains_enforced(self):
+        calibration, cfg = self.calibration(); t = np.arange(20)/30
+        calibration["configuration_id"] = "previous-classifier-configuration"
         with self.assertRaises(ValueError):
-            classify_episode(t, f, p, calibration, cfg)
+            classify_window(t,np.arange(20),.2,calibration,cfg)
 
     def test_episode_sign_baseline_and_no_cross_episode_noise(self):
         cfg = PhaseConfig(); t = np.arange(30)/30.
@@ -212,6 +308,31 @@ class IntegratedPhase4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
+
+    def test_irregular_episode_summary_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = synthetic_source(root)
+            for ep in (source.episodes[0],source.episodes[-1]):
+                ep.timestamps[30:] += 1
+                ep.video_timestamps = ep.timestamps.copy()
+            cfg = PhasePipelineConfig(data_root=str(root),sensors=["sensor"],split_reference=None,
+                                      prepared_dir=str(root/"prepared"),gallery_size=4)
+            with patch.object(source,"_images",side_effect=AssertionError("No decoding for timestamp audit")):
+                report = prepare_phase4(source,cfg)
+            episodes = json.loads((Path(cfg.prepared_dir)/"episodes.json").read_text())
+            timing = report["timestamp_diagnostics"]
+            self.assertEqual(timing["irregular_episodes"],2)
+            self.assertEqual(timing["irregular_episodes_by_sensor"],{"sensor":2})
+            self.assertEqual(sum(timing["irregular_episodes_by_split"].values()),2)
+            self.assertEqual(report,load_prepared(cfg.prepared_dir))
+            for ep in episodes:
+                audit = json.loads((Path(cfg.prepared_dir)/ep["label_file"]).with_suffix(".json").read_text())
+                self.assertEqual(audit["timestamp_diagnostics"],ep["preprocessing"]["timestamp_diagnostics"])
+                self.assertEqual(audit["timestamp_diagnostics"]["exceeds_relative_tolerance"],
+                                 ep["preprocessing"]["window_02"]["exceeds_relative_tolerance"])
+            cfg.classifier = PhaseConfig(timestamp_relative_tolerance=.2)
+            with self.assertRaisesRegex(FileExistsError,"new prepared_dir"):
+                prepare_phase4(source,cfg)
 
     def test_zero_signal_is_retained_and_failed_sensor_is_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -324,6 +445,11 @@ class IntegratedPhase4Tests(unittest.TestCase):
             self.assertTrue(all(r["training"] == "failed" for r in state["N"].values()))
             for n in (1,3):
                 frozen = OmegaConf.load(out/f"N{n}_seed42/resolved_training.yaml")
+                from wandb import Settings
+                # Validate with the actual SDK without init(), login or remote runs.
+                Settings(run_tags=tuple(frozen.wandb.tags))
+                self.assertTrue(all(1 <= len(tag) <= 64 for tag in frozen.wandb.tags))
+                self.assertIn(f"phase4-experiment:{state['experiment_id'][:40]}",frozen.wandb.tags)
                 self.assertEqual(frozen.training.batch_size,base.training.batch_size)
                 self.assertEqual(frozen.training.gradient_accumulation_steps,base.training.gradient_accumulation_steps)
                 self.assertEqual(frozen.training.scheduler,base.training.scheduler)

@@ -31,7 +31,7 @@ class PhasePipelineConfig:
     test_fraction: float = .1
     prepared_dir: str = "metadata/phase4/v1"
     results_dir: str = "outputs/phase4/v1"
-    training_config: str = "taf_adapter_sparsh_episode"
+    training_config: str = "taf_adapter_sparsh_episode_stable"
     windows: list[int] = field(default_factory=lambda: [1, 3, 5, 7, 10, 20])
     seed: int = 42
     eval_batch_size: int = 16
@@ -272,8 +272,16 @@ def prepare_phase4(source, cfg: PhasePipelineConfig):
         gallery = save_gallery_plan(dataset.rows, stage/"gallery_plan.json", seed=cfg.gallery_seed,
                                     max_pairs=cfg.gallery_size, min_gap=cfg.gallery_gap)
         support = _support(pq.read_table(stage/"manifest.parquet"), "phase")
+        irregular = [r for r in summaries if r["preprocessing"]["timestamp_diagnostics"]["exceeds_relative_tolerance"]]
         report = {**recipe, "recipe_id": recipe_id, "manifest_id": manifest_id, "split_id": split_id,
                   "calibration_id": calibration_id, "episodes": len(summaries), "anchor_support": support,
+                  "timestamp_diagnostics": {
+                      "timestamp_relative_tolerance": cfg.classifier.timestamp_relative_tolerance,
+                      "tolerance_role": "diagnostic_only", "irregular_episodes": len(irregular),
+                      "irregular_episodes_by_split": {s: sum(r["split"] == s for r in irregular)
+                                                       for s in ("train", "validation", "test")},
+                      "irregular_episodes_by_sensor": {s: sum(r["sensor_configuration"] == s for r in irregular)
+                                                        for s in sorted({r["sensor_configuration"] for r in summaries})}},
                   "frame_support": [{"split": k[0], "sensor": k[1], "phase": k[2], "frames": v} for k, v in sorted(frame_counts.items())],
                   "exclusions": {"insufficient_history": sum(r["excluded_insufficient_history"] for r in summaries)},
                   "failures": [], "normalization_file": normal_path,

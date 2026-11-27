@@ -43,13 +43,15 @@ uv pip install --python .venv/bin/python -r requirements-ui.txt
 다른 설정 파일은 `--config 경로`, 일부 값 변경은 `--set key=value`로 전달한다.
 
 ```bash
-# 현재 실험 중인 stable 설정을 선택하는 경우에도 그 YAML 자체는 변경하지 않는다.
-bash scripts/phase4.sh run --n 5 --set training_config=taf_adapter_sparsh_episode_stable
+# K-means++/scheduler를 사용하지 않는 기존 설정을 선택하려면 명시적으로 override한다.
+bash scripts/phase4.sh run --n 5 --set training_config=taf_adapter_sparsh_episode
 # 새 준비 설정을 비교할 때는 준비/결과 경로도 새로 지정한다.
 bash scripts/phase4.sh prepare --set prepared_dir=metadata/phase4/another_protocol
 ```
 
-기본 학습 설정은 `taf_adapter_sparsh_episode`다. 원하는 기존 Hydra 설정을 `training_config`에 지정한다.
+기본 학습 설정은 `taf_adapter_sparsh_episode_stable`이다. K-means++ 초기화(16,384 samples, 20 iterations, seed42)와
+500-step Linear Warmup + Cosine LR(1e-6 → 1e-4 → 1e-5)을 사용하며, N별 학습량은 10,000 updates다.
+원하는 기존 Hydra 설정을 `training_config`에 지정한다.
 K-means와 scheduler 옵션은 입력 설정의 값을 그대로 가져오며, 새 구현이나 override를 넣지 않았다.
 모든 N에서 seed는 42 하나, batch size·accumulation·update budget·sampler·optimizer 조건은 동일하다.
 InfoNCE negative 수는 실제 forward batch에 의해 정해지며 accumulation으로 늘어나지 않는다.
@@ -120,9 +122,25 @@ Validation/Test에는 저장한 기준값을 적용하며, episode별 부호/하
 0.2/0.3초 창은 모델 N과 독립적이다. 30Hz에서는 각각 7표본(좌3/우3), 10표본(좌4/우5)이다.
 선형 회귀 기울기와 끝점 차이, range_fraction=.02, noise multiplier=3, Holding 절반 threshold,
 단일 창 run 최소2프레임을 팀원 구현과 같이 적용한다. Fusion 뒤에는 추가 필터를 넣지 않는다.
-Timestamp 단조성·finite·sampling 간격을 검증하고 실제 support/span을 기록한다.
+Timestamp는 finite이며 엄격히 증가해야 한다. 간격이 불규칙하거나 프레임 누락처럼 큰 간격이 있어도
+episode 전체의 **median dt**로 창 크기와 균일한 회귀 시간축을 계산한다(팀원 구현과 동일).
+Resampling, interpolation, 실제 timestamp 기반 회귀, 불규칙 간격에 따른 frame 제외는 하지 않는다.
+`timestamp_relative_tolerance=0.1`은 중단 조건이 아닌 **진단용**이다. Episode audit의
+`timestamp_diagnostics`에 median/min/max dt, 최대 상대 편차, 기준 초과 여부를 저장하고,
+`summary.json`과 CLI 종료 요약의 같은 항목에 불규칙 episode 수와 split/sensor별 개수를 기록한다. 개별 warning은 출력하지 않는다.
+창 metadata의 `nominal_span_seconds`는 `intervals × median dt`다(팀원 코드에서는 이 값을 `actual_span_seconds`라 부른다).
+실제 timestamp로 측정한 창 길이는 frame별 `actual_span_02`/`actual_span_03`, 창별
+`actual_span_seconds_min`/`actual_span_seconds_median`/`actual_span_seconds_max`로 구분한다.
 창이 부족한 경계/짧은 episode는 이유와 함께 Unknown으로 기록하지만 파일 오류·NaN·매칭 오류는 실패 처리한다.
 이 라벨은 미래 force와 episode 전체 부호/baseline을 사용하는 offline 휴리스틱이며 사람 정답 검증은 아니다.
+
+Classifier 소스 checksum은 configuration/preparation identity에 포함된다. 이 변경 전의 calibration/manifest는
+새 구현과 혼용하지 않으며, 기존 산출물을 보존하려면 새 경로로 준비한다. 아래 override는 현재 YAML의
+센서·split·학습 설정을 그대로 사용한다. 이후 학습·UI 명령에도 동일한 `prepared_dir`를 지정한다.
+
+```bash
+bash scripts/phase4.sh prepare --set prepared_dir=metadata/phase4/gs_mini_median_dt_v2
+```
 
 ## 두 예측 방법과 지표
 

@@ -365,13 +365,9 @@ class ExperimentLogger:
             if self.run is not None:
                 self.run.finish(exit_code=1)
                 self.run = None
-            hint = (
-                " Configure WANDB_API_KEY or run `wandb login`."
-                if str(self.config.mode) == "online" else ""
-            )
             raise RuntimeError(
-                f"W&B initialization failed in {self.config.mode!r} mode."
-                f"{hint} No fallback mode was selected."
+                f"W&B initialization failed in {self.config.mode!r} mode. "
+                f"Cause: {type(exc).__name__}: {exc}. No fallback mode was selected."
             ) from exc
 
     def start_progress(self, max_steps: int, initial_step: int = 0) -> None:

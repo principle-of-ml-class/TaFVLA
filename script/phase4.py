@@ -107,7 +107,7 @@ def evaluate(settings, checkpoint_path, output, experiment_id, *, frozen_config=
     n = int(checkpoint["config"]["data"]["window_size"])
     cfg = frozen_config if frozen_config is not None else training_config(settings, n)
     if frozen_config is None:
-        cfg.wandb.tags = [*cfg.wandb.tags, f"phase4-experiment:{experiment_id}"]
+        cfg.wandb.tags = [*cfg.wandb.tags, f"phase4-experiment:{experiment_id[:40]}"]
     _assert_checkpoint(checkpoint, cfg, prepared["manifest_id"], require_finished=True)
     normal_path = Path(settings.prepared_dir)/prepared["normalization_file"]
     normal = torch.load(normal_path, weights_only=True, map_location="cpu")["normalization"]
@@ -168,7 +168,7 @@ def run_windows(settings, windows, *, dry_run=False):
         cfg = training_config(settings, n)
         cfg.training.output_dir = str(training_output)
         cfg.wandb.name = f"Phase4-N{n}-seed42"; cfg.wandb.group = f"phase4-{experiment_id[:12]}"
-        cfg.wandb.tags = [*cfg.wandb.tags, f"phase4-experiment:{experiment_id}"]
+        cfg.wandb.tags = [*cfg.wandb.tags, f"phase4-experiment:{experiment_id[:40]}"]
         train = ["uv", "run", "--no-sync", "python", "-m", "script.train_adapter",
                  f"--config-path={base.resolve()}", "--config-name=resolved_training"]
         command = ["uv", "run", "--no-sync", "python", "-m", "script.terminal_monitor", "--metrics", str(run_dir/"metrics.jsonl"),
@@ -313,7 +313,7 @@ def main(argv=None):
         from utils.phase4_data import prepare_from_settings
         report = prepare_from_settings(settings)
         print(json.dumps({"prepared_dir": settings.prepared_dir, **{key: report[key] for key in
-                         ("manifest_id", "dataset_id", "episodes", "anchor_support", "exclusions", "reference_source")}}, indent=2))
+                         ("manifest_id", "dataset_id", "episodes", "anchor_support", "exclusions", "timestamp_diagnostics", "reference_source")}}, indent=2))
     elif args.command == "run":
         run_windows(settings, args.n or settings.windows, dry_run=args.dry_run)
     elif args.command == "aggregate":
